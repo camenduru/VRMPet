@@ -26,7 +26,7 @@ A per-material breakdown is not possible from images alone, but the missed
 pixels are localised, so they are reported by screen region. The head band is
 where the BLEND materials live, so it is the region that matters.
 
-usage: compare_mask.py <run-dir>
+usage: compare_mask.py <run-dir> [avatar-eps]
 """
 
 import os
@@ -40,6 +40,11 @@ from PIL import Image
 # deterministic and both frames come from the identical pipeline, so anything
 # above the noise floor is real geometry. The background is a flat sky, so the
 # floor is very low.
+#
+# Overridable as the second argument. Worth doing: the model's dark navy jacket
+# and black shoes sit right at this threshold against a black background, so the
+# headline precision figure moves a lot between eps=6 and eps=0 while recall does
+# not move at all. Reporting only one of the two hides that.
 AVATAR_EPS = 6
 
 
@@ -70,6 +75,7 @@ def band_name(y, h):
 
 def main():
     run_dir = sys.argv[1] if len(sys.argv) > 1 else "."
+    eps = int(sys.argv[2]) if len(sys.argv) > 2 else AVATAR_EPS
 
     need = ("mask_nostencil.png", "background.png", "mask_default.png")
     missing = [f for f in need if not os.path.exists(os.path.join(run_dir, f))]
@@ -89,7 +95,7 @@ def main():
 
     # --- ground truth footprint, from colour alone -------------------------
     delta = np.abs(full[..., :3].astype(np.int16) - bg[..., :3].astype(np.int16))
-    avatar = delta.max(axis=2) > AVATAR_EPS
+    avatar = delta.max(axis=2) > eps
 
     # --- what the stencil mask claims -------------------------------------
     covered = mask[..., 3] > 0
@@ -104,6 +110,7 @@ def main():
 
     hr("coverage")
     print(f"frame                       : {w} x {h}")
+    print(f"avatar threshold (eps)      : {eps}")
     print(f"avatar footprint (ground truth): {n_avatar:>8,}  ({100.0 * n_avatar / avatar.size:6.3f}%)")
     print(f"stencil mask coverage          : {n_covered:>8,}  ({100.0 * n_covered / avatar.size:6.3f}%)")
     print(f"agreement (in both)            : {int(both.sum()):>8,}")

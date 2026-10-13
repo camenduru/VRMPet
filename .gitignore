@@ -90,7 +90,15 @@ head_composite_vs_truth.png
 
 # Desktop grabs and the comparisons built from them, for anyone who runs the
 # tool from the project root rather than from build/run.
+#
+# A desktop grab is a picture of whatever else was on screen. It is never worth
+# committing - see the note in tools/grab_desktop.ps1 - so it is ignored by
+# shape as well as by the specific names the verification runs used. docs/ is
+# NOT covered: what lives there is rendered engine output only.
 desktop*.png
+grab*.png
+*_grab.png
+*_desktop.png
 anim_*.png
 final_*.png
 *_compare.png

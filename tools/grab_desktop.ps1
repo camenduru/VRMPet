@@ -4,6 +4,11 @@
 # click-through, topmost window with no taskbar button - so verifying it means
 # capturing the real desktop underneath it and looking.
 #
+# IMPORTANT: the output is a picture of whatever else was on screen. Write it
+# somewhere disposable (build/run/ is gitignored) and do NOT commit it. That is
+# why REPORT.md describes the overlay verification in words rather than shipping
+# the screenshot.
+#
 # usage: powershell -File tools/grab_desktop.ps1 <out.png>
 
 param([Parameter(Mandatory = $true)][string]$Out)

@@ -150,6 +150,38 @@ namespace
         return path;
     }
 
+    // The capture tool writes its PNGs and its log into the output directory, and
+    // wi::backlog::SetLogFile() does not create it. Without this a run against a
+    // directory that does not exist yet does all the work and then writes nothing,
+    // silently - the worst possible failure mode for a diagnostic tool.
+    bool EnsureDirectory(const std::string& dir)
+    {
+        if (dir.empty() || dir == "." || wi::helper::DirectoryExists(dir))
+            return true;
+
+        const int len = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0);
+        if (len <= 0)
+            return false;
+        std::wstring wide(size_t(len), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, wide.data(), len);
+
+        // Create every missing component, so "out/body" works as well as "out".
+        for (size_t i = 1; i < wide.size(); ++i)
+        {
+            if (wide[i] == L'/' || wide[i] == L'\\')
+            {
+                const std::wstring partial = wide.substr(0, i);
+                if (!CreateDirectoryW(partial.c_str(), nullptr) &&
+                    GetLastError() != ERROR_ALREADY_EXISTS)
+                {
+                    return false;
+                }
+            }
+        }
+        return CreateDirectoryW(wide.c_str(), nullptr) != FALSE
+            || GetLastError() == ERROR_ALREADY_EXISTS;
+    }
+
     std::string Fmt(float v)
     {
         char buf[64];
@@ -358,6 +390,7 @@ public:
 
         // Route the engine's own log to disk. Without this a standalone GUI app
         // has no visible output at all and failures are silent.
+        EnsureDirectory(g_outDir);
         wi::backlog::SetLogFile(g_outDir + "/engine.log");
         wi::backlog::SetLogLevel(wi::backlog::LogLevel::Default);
         wi::backlog::post("VRMPet: === initialize ===");
