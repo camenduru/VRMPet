@@ -15,18 +15,33 @@
 //  Uses only public WickedEngine API. Nothing in the engine is modified.
 //
 //  Capture mode - writes PNGs for analysis:
-//    VRMPet.exe [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa]
+//    VRMPet.exe [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa] [anim.vrma]
 //
 //  Overlay mode - the avatar standing on the desktop, no window, no background:
-//    VRMPet.exe overlay [model.vrm] [azimuth-deg] [msaa] [seconds]
+//    VRMPet.exe overlay [model.vrm] [azimuth-deg] [msaa] [seconds] [anim.vrma]
 //      azimuth 180 faces the camera. seconds 0 = run until Ctrl+Shift+Q.
+//
+//  Both modes default to the assets/ copy of the avatar, so the tool runs with
+//  no arguments at all. Overlay mode also defaults to the assets/ idle loop,
+//  retargeted onto the avatar at load time; capture mode leaves the animation
+//  off unless a path is given, because its mask captures are differenced across
+//  frames and a moving character would make them disagree. A trailing "-" or
+//  "none" disables the animation in either mode.
+//
+//  A bare "lookat" or "nolookat" token anywhere on the command line forces the
+//  humanoid look-at solver on or off. It defaults to on in overlay mode - the
+//  camera is the viewer's eye there, so the pet watches whoever is looking at
+//  the screen - and off in capture mode, where the pose should be exactly the
+//  one the animation produces.
 // ---------------------------------------------------------------------------
 
 #include "WickedEngine.h"
 
 #include <shellapi.h>
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -51,7 +66,13 @@ namespace
     constexpr float   kFarPlane       = 100.0f;
 
     std::string g_outDir     = ".";
-    std::string g_modelPath  = "C:/Users/PC/Documents/fish.audio/web/vrm/AvatarSample_B.vrm";
+    std::string g_modelPath  = "assets/AvatarSample_B.vrm";
+    // A .vrma is not an animation *for* the avatar - it is a humanoid animation
+    // on a bare 33-node skeleton of its own. It has to be retargeted onto the
+    // avatar's skeleton at load time; see PetApp::ApplyAnimation(). Assigned
+    // per-mode in wWinMain: the overlay defaults to the idle loop, capture mode
+    // defaults to none. "-" or "none" disables it in either mode.
+    std::string g_animPath;
     float       g_azimuthDeg = 0.0f;
     int         g_focusMesh  = -1;   // -1: frame the whole body, else one mesh index
     int         g_isolateMesh = -1;  // -1: show everything, else hide all but this mesh
@@ -64,6 +85,14 @@ namespace
     float g_bootFar  = -1.0f;
     float g_bootFov  = -1.0f;
 
+    // Opt-in: re-enable the engine's humanoid look-at solver and aim it at the
+    // camera every frame, so the pet watches the viewer instead of holding
+    // whatever the animation does with the head. Defaults on in overlay mode and
+    // off in capture mode - see the note in PetApp::LoadModel() for what the
+    // solver does when nobody aims it. Overridable with a bare "lookat" or
+    // "nolookat" token on the command line.
+    bool g_lookAtCamera = false;
+
     std::string Narrow(const wchar_t* wide)
     {
         if (wide == nullptr)
@@ -74,6 +103,51 @@ namespace
         std::string out(size_t(len - 1), '\0');
         WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
         return out;
+    }
+
+    std::string JoinPath(std::string dir, const std::string& rel)
+    {
+        if (!dir.empty() && dir.back() != '/' && dir.back() != '\\')
+            dir += '/';
+        return dir + rel;
+    }
+
+    // The default asset paths are relative - "assets/AvatarSample_B.vrm" - so the
+    // project folder stays the single source of truth rather than an absolute
+    // path to one machine's Documents directory. CMake stages assets/ next to the
+    // executable the same way it stages dxcompiler.dll, so running from build/run
+    // works; resolving against the executable as well means the tool also works
+    // from the project root or from a shortcut, whatever the working directory
+    // happens to be. An absolute path on the command line is always honoured
+    // as-is, because FileExists() succeeds on it immediately.
+    std::string ResolveAssetPath(const std::string& path)
+    {
+        if (path.empty() || path == "-" || path == "none")
+            return path;
+
+        if (wi::helper::FileExists(path))
+            return path;
+
+        const std::string exeDir =
+            wi::helper::GetDirectoryFromPath(wi::helper::GetExecutablePath());
+
+        const std::string candidates[] = {
+            JoinPath(exeDir, path),              // build/run/assets/...
+            JoinPath(exeDir, "../" + path),      // build/assets/...
+            JoinPath(exeDir, "../../" + path),   // <project>/assets/...
+        };
+        for (const std::string& candidate : candidates)
+        {
+            if (wi::helper::FileExists(candidate))
+            {
+                wi::backlog::post("VRMPet: resolved '" + path + "' -> " + candidate);
+                return candidate;
+            }
+        }
+
+        wi::backlog::post("VRMPet: WARNING - '" + path + "' not found relative to '"
+            + exeDir + "' or the working directory");
+        return path;
     }
 
     std::string Fmt(float v)
@@ -106,6 +180,14 @@ namespace
     // Frames to render before the first blit, so spring bones and temporal
     // effects have settled and the character is not captured mid-twitch.
     constexpr int kOverlaySettleFrames = 30;
+
+    // An idle loop sways the hips and swings the arms, so the tight alpha box
+    // measured over the first few settled frames is not necessarily the box for
+    // the whole loop. Pad it generously, and re-measure once a second so a
+    // too-tight crop reports itself as a number in the log rather than as a
+    // hand quietly losing its fingers at the window edge.
+    constexpr int kOverlayPad         = 40;
+    constexpr int kOverlayCheckFrames = 60;
 
     struct LayeredOverlay
     {
@@ -264,6 +346,11 @@ public:
     int  cropX = 0, cropY = 0, cropW = 0, cropH = 0;
     long long overlayFrames = 0;
     std::chrono::steady_clock::time_point overlayClock;
+    int  overlayCheck = 0;      // frames since the last crop-box re-measure
+    // Worst px by which the character has left the crop box. Negative means
+    // margin. Starts at INT_MIN so the very first measurement always reports,
+    // whether it is a warning or the reassuring "still contains it" line.
+    int  overlayOverflow = INT_MIN;
 
     void Initialize() override
     {
@@ -276,6 +363,14 @@ public:
         wi::backlog::post("VRMPet: === initialize ===");
         wi::backlog::post("VRMPet: shader binary path = " + wi::renderer::GetShaderPath());
         wi::backlog::post("VRMPet: shader source path = " + wi::renderer::GetShaderSourcePath());
+        wi::backlog::Flush();
+
+        // Relative asset paths resolve against the working directory first, then
+        // against the executable. Done here rather than in wWinMain because the
+        // log file only exists from this point on, and a path that failed to
+        // resolve is exactly the thing that needs to be in the log.
+        g_modelPath = ResolveAssetPath(g_modelPath);
+        g_animPath  = ResolveAssetPath(g_animPath);
         wi::backlog::Flush();
 
         // The projection on a bare RenderPath3D turned out to be all-NaN, so record
@@ -341,6 +436,10 @@ public:
 
     void Update(float dt) override
     {
+        // Must run before the base Update() - that is what steps the scene, and
+        // the humanoid solver reads humanoid.lookAt while it does.
+        AimLookAt();
+
         wi::Application::Update(dt);
 
         if (g_overlayMode)
@@ -427,6 +526,27 @@ public:
 
 private:
     // -----------------------------------------------------------------------
+    // Look-at
+    //
+    // HumanoidComponent::lookAt is a world-space point, and the solver turns the
+    // head and both eyes toward it, clamped by head_rotation_max (60 deg yaw,
+    // 30 deg pitch) and eye_rotation_max, and eased in by head_rotation_speed so
+    // it never snaps. Pointing it at the camera is what makes the pet watch
+    // whoever is looking at the screen.
+    // -----------------------------------------------------------------------
+    void AimLookAt()
+    {
+        if (!g_lookAtCamera)
+            return;
+
+        wi::scene::Scene& scene = wi::scene::GetScene();
+        if (scene.humanoids.GetCount() == 0 || path == nullptr || path->camera == nullptr)
+            return;
+
+        scene.humanoids[0].lookAt = path->camera->Eye;
+    }
+
+    // -----------------------------------------------------------------------
     // Overlay mode
     // -----------------------------------------------------------------------
     void UpdateOverlay()
@@ -453,9 +573,10 @@ private:
         CaptureAndBlit();
     }
 
-    // Tight box around everything with non-zero alpha. Used once, to size the
-    // overlay window to the character rather than to the whole 1024x1024 frame.
-    bool ComputeCropBox(const uint8_t* rgba, int w, int h)
+    // Tight box around everything with non-zero alpha, in render-target pixels.
+    // Returns false when nothing was rasterised (a fully transparent frame).
+    static bool TightBox(const uint8_t* rgba, int w, int h,
+                         int& outX, int& outY, int& outW, int& outH)
     {
         int minX = w, minY = h, maxX = -1, maxY = -1;
         for (int y = 0; y < h; ++y)
@@ -475,11 +596,70 @@ private:
         if (maxX < minX || maxY < minY)
             return false;
 
-        cropX = minX;
-        cropY = minY;
-        cropW = maxX - minX + 1;
-        cropH = maxY - minY + 1;
+        outX = minX;
+        outY = minY;
+        outW = maxX - minX + 1;
+        outH = maxY - minY + 1;
         return true;
+    }
+
+    // The box the overlay window covers. Used once, to size the window to the
+    // character rather than to the whole 1024x1024 frame, then padded so the
+    // animation has room to move inside it.
+    bool ComputeCropBox(const uint8_t* rgba, int w, int h)
+    {
+        int x, y, bw, bh;
+        if (!TightBox(rgba, w, h, x, y, bw, bh))
+            return false;
+
+        const int left   = std::max(0, x - kOverlayPad);
+        const int top    = std::max(0, y - kOverlayPad);
+        const int right  = std::min(w, x + bw + kOverlayPad);
+        const int bottom = std::min(h, y + bh + kOverlayPad);
+
+        cropX = left;
+        cropY = top;
+        cropW = right - left;
+        cropH = bottom - top;
+        return true;
+    }
+
+    // Re-measure the character's footprint and compare it with the window we
+    // already sized. An idle loop should stay well inside the padded box; if it
+    // ever does not, that is a real clipping bug and it needs to be visible.
+    void CheckCropBox(const uint8_t* rgba, int w, int h)
+    {
+        int x, y, bw, bh;
+        if (!TightBox(rgba, w, h, x, y, bw, bh))
+            return;
+
+        const int overL = cropX - x;
+        const int overT = cropY - y;
+        const int overR = (x + bw) - (cropX + cropW);
+        const int overB = (y + bh) - (cropY + cropH);
+        const int worst = std::max(std::max(overL, overT), std::max(overR, overB));
+
+        if (worst > overlayOverflow)
+        {
+            overlayOverflow = worst;
+            char buf[200];
+            if (worst > 0)
+            {
+                snprintf(buf, sizeof(buf),
+                    "VRMPet: WARNING - character leaves the crop box by %d px "
+                    "(box %dx%d at %d,%d, tight %dx%d at %d,%d) - raise kOverlayPad",
+                    worst, cropW, cropH, cropX, cropY, bw, bh, x, y);
+            }
+            else
+            {
+                snprintf(buf, sizeof(buf),
+                    "VRMPet: crop box %dx%d at %d,%d still contains the character "
+                    "(%d px of margin)",
+                    cropW, cropH, cropX, cropY, -worst);
+            }
+            wi::backlog::post(buf);
+            wi::backlog::Flush();
+        }
     }
 
     void CaptureAndBlit()
@@ -524,7 +704,8 @@ private:
                 + std::to_string(cropH) + " at " + std::to_string(px) + ","
                 + std::to_string(py) + "  (work area "
                 + std::to_string(wa.right - wa.left) + "x" + std::to_string(wa.bottom - wa.top)
-                + ", crop from " + std::to_string(cropX) + "," + std::to_string(cropY) + ")");
+                + ", crop from " + std::to_string(cropX) + "," + std::to_string(cropY)
+                + ", " + std::to_string(kOverlayPad) + " px pad for the animation)");
             wi::backlog::Flush();
 
             overlayCreated = true;
@@ -533,6 +714,14 @@ private:
 
         g_overlay.Blit(rgba.data(), w, cropX, cropY);
         g_overlay.Push();
+
+        // The window is sized once and never resized, so re-measure occasionally
+        // and complain if the animation has walked the character out of it.
+        if (++overlayCheck >= kOverlayCheckFrames)
+        {
+            overlayCheck = 0;
+            CheckCropBox(rgba.data(), w, h);
+        }
 
         ++overlayFrames;
         const double elapsed =
@@ -547,6 +736,150 @@ private:
             overlayFrames = 0;
             overlayClock = std::chrono::steady_clock::now();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Animation
+    //
+    // idle_loop.vrma is a VRM Animation: 33 nodes, no meshes, 28 channels over
+    // 22 humanoid bones. It is not an animation *for* this avatar - it carries a
+    // skeleton of its own, in its own units, with its own rest pose. Playing it
+    // directly would animate nodes nobody can see.
+    //
+    // Scene::RetargetAnimation() is the engine's own answer to that, and it is
+    // the same call the Editor makes. For every source channel whose target is a
+    // humanoid bone it matches the bone by HumanoidComponent::bones[] index -
+    // the VRM spec's own bone identity, so nothing is matched by name - and
+    // records the rest-pose offset between the two skeletons. At runtime each
+    // keyframe is pushed through that offset. That is what lets a 90 cm-tall,
+    // 0.01-scaled centimetre skeleton drive a metre-scale avatar without the
+    // avatar turning into a giant or collapsing to the origin.
+    //
+    // The VRMA goes into a throwaway Scene, for three reasons: its own
+    // HumanoidComponent would otherwise be a second humanoid in the main scene,
+    // indistinguishable from the avatar's; its 33 nodes and 0.01 root scale
+    // would pollute the scene the stencil mask is computed from; and
+    // bake_data=true copies the retargeted keyframes into the main scene, so the
+    // scratch scene can be destroyed the moment this returns.
+    // -----------------------------------------------------------------------
+    void ApplyAnimation()
+    {
+        wi::scene::Scene& scene = wi::scene::GetScene();
+
+        if (g_animPath.empty() || g_animPath == "-" || g_animPath == "none")
+        {
+            wi::backlog::post("VRMPet: animation disabled");
+            return;
+        }
+
+        if (scene.humanoids.GetCount() == 0)
+        {
+            wi::backlog::post("VRMPet: " + g_modelPath
+                + " imported no humanoid - cannot retarget " + g_animPath);
+            return;
+        }
+        const wi::ecs::Entity avatarRoot = scene.humanoids.GetEntity(0);
+
+        wi::scene::Scene animScene;
+        wi::backlog::post("VRMPet: loading animation " + g_animPath);
+        ImportModel_GLTF(g_animPath, animScene);
+        wi::backlog::post("VRMPet: animation import returned  nodes="
+            + std::to_string(animScene.transforms.GetCount())
+            + " humanoids=" + std::to_string(animScene.humanoids.GetCount())
+            + " animations=" + std::to_string(animScene.animations.GetCount()));
+
+        if (animScene.humanoids.GetCount() == 0 || animScene.animations.GetCount() == 0)
+        {
+            wi::backlog::post("VRMPet: " + g_animPath
+                + " has no humanoid or no animation - nothing to retarget");
+            return;
+        }
+
+        constexpr size_t kBoneCount = size_t(wi::scene::HumanoidComponent::HumanoidBone::Count);
+        const wi::scene::HumanoidComponent& srcHumanoid = animScene.humanoids[0];
+        const wi::scene::HumanoidComponent& dstHumanoid = scene.humanoids[0];
+
+        size_t commonBones = 0;
+        for (size_t i = 0; i < kBoneCount; ++i)
+        {
+            if (srcHumanoid.bones[i] != wi::ecs::INVALID_ENTITY &&
+                dstHumanoid.bones[i] != wi::ecs::INVALID_ENTITY)
+            {
+                ++commonBones;
+            }
+        }
+
+        const wi::ecs::Entity animSource = animScene.animations.GetEntity(0);
+        const wi::scene::AnimationComponent& srcAnim = animScene.animations[0];
+
+        std::string animName;
+        if (const wi::scene::NameComponent* nc = animScene.names.GetComponent(animSource))
+            animName = nc->name;
+
+        // A channel whose target is not one of the VRMA's 22 humanoid bones has
+        // no bone identity to match on and cannot be retargeted. This VRMA is
+        // authored on a 33-node skeleton, so the extra spine/neck segments and
+        // the head node itself fall out here - three-vrm's VRMAnimationLoader
+        // drops exactly the same channels. Listing them makes the consequence
+        // explicit: the head does not move, because the file maps `head` to a
+        // leaf end-site rather than to the animated head node.
+        size_t dropped = 0;
+        std::string droppedNames;
+        for (const wi::scene::AnimationComponent::AnimationChannel& ch : srcAnim.channels)
+        {
+            bool isHumanoidBone = false;
+            for (size_t i = 0; i < kBoneCount && !isHumanoidBone; ++i)
+                isHumanoidBone = (srcHumanoid.bones[i] == ch.target);
+
+            if (!isHumanoidBone)
+            {
+                ++dropped;
+                if (const wi::scene::NameComponent* nc = animScene.names.GetComponent(ch.target))
+                {
+                    if (!droppedNames.empty())
+                        droppedNames += ", ";
+                    droppedNames += nc->name;
+                }
+            }
+        }
+
+        wi::backlog::post("VRMPet: retargeting '" + animName + "'  bones_in_common="
+            + std::to_string(commonBones) + "/" + std::to_string(kBoneCount)
+            + "  channels=" + std::to_string(srcAnim.channels.size())
+            + "  dropped=" + std::to_string(dropped)
+            + (droppedNames.empty() ? "" : " (" + droppedNames + ")")
+            + "  length=" + Fmt(srcAnim.end - srcAnim.start) + "s");
+
+        const wi::ecs::Entity retargeted =
+            scene.RetargetAnimation(avatarRoot, animSource, true, &animScene);
+        if (retargeted == wi::ecs::INVALID_ENTITY)
+        {
+            wi::backlog::post("VRMPet: RetargetAnimation() found no usable channel");
+            wi::backlog::Flush();
+            return;
+        }
+
+        wi::scene::AnimationComponent* anim = scene.animations.GetComponent(retargeted);
+        if (anim == nullptr)
+        {
+            wi::backlog::post("VRMPet: retargeted animation has no component");
+            wi::backlog::Flush();
+            return;
+        }
+
+        // The import leaves the flags at their default LOOPED with PLAYING clear,
+        // and the retarget copies the source's flags, so this has to be explicit.
+        // An idle loop is only useful if it loops.
+        anim->Play();
+        anim->SetLooped(true);
+        anim->timer = 0.0f;
+        anim->last_update_time = 0.0f;
+
+        wi::backlog::post("VRMPet: animation playing - "
+            + std::to_string(anim->channels.size()) + " channels retargeted onto "
+            + std::to_string(anim->samplers.size()) + " samplers, looped over "
+            + Fmt(anim->end - anim->start) + "s");
+        wi::backlog::Flush();
     }
 
     void LoadModel()
@@ -613,6 +946,41 @@ private:
                 + " blendMode=" + std::to_string((int)mat.userBlendMode)
                 + " alphaRef=" + Fmt(mat.alphaRef)
                 + " baseColorW=" + Fmt(mat.baseColor.w));
+        }
+
+        // Retarget the idle loop onto the skeleton that was just imported. Must
+        // happen before the first rendered frame, so the character never appears
+        // in the bind pose.
+        ApplyAnimation();
+
+        // WickedEngine enables the humanoid look-at solver by default
+        // (HumanoidComponent::_flags is initialised to LOOKAT) and its target,
+        // HumanoidComponent::lookAt, defaults to the world origin. The solver
+        // runs whenever that flag is set - lookAtEntity only gates whether the
+        // target gets refreshed from an entity - so out of the box the head and
+        // both eyes are rotated every frame to stare at (0, 0, 0), which is down
+        // at the character's feet. Nothing errors, nothing is logged, the pose
+        // just comes out wrong: the head ends up clamped against
+        // head_rotation_max (60 deg yaw, 30 deg pitch) at an angle nothing in the
+        // model or the animation asks for.
+        //
+        // Measured with the diagnostic in DumpSceneState(): with the solver on
+        // and left aimed at the origin, the head's lateral axis sits 55 deg off
+        // the neck's in the bind pose and 128 deg off once the animation is
+        // playing - it is the difference between the two screenshots in
+        // REPORT.md section 5.
+        //
+        // So it is always aimed deliberately. Off (capture mode): the head
+        // follows the neck, which is what the retargeted animation expects - the
+        // .vrma's own head channel is dropped during retargeting anyway (see
+        // ApplyAnimation), so there is nothing for the solver to blend against.
+        // On (overlay mode): AimLookAt() points it at the camera every frame, so
+        // the pet watches whoever is looking at the screen.
+        if (wi::scene::HumanoidComponent* hum = scene.humanoids.GetComponent(scene.humanoids.GetEntity(0)))
+        {
+            hum->SetLookAtEnabled(g_lookAtCamera);
+            wi::backlog::post(std::string("VRMPet: look-at solver ")
+                + (g_lookAtCamera ? "ON - aimed at the camera" : "OFF - head follows the neck"));
         }
 
         scene.Entity_CreateLight("key",
@@ -683,6 +1051,85 @@ private:
         wi::backlog::post("VRMPet: activePath=" + std::to_string(GetActivePath() != nullptr ? 1 : 0));
         wi::backlog::post("VRMPet: gameSpeed=" + Fmt(wi::renderer::GetGameSpeed()));
         wi::backlog::post("VRMPet: scene camera entities=" + std::to_string(scene.cameras.GetCount()));
+
+        // Which way is the face actually pointing? Reading it off a screenshot is
+        // guesswork; reading it off the bones is not. The eye bones give the
+        // head's own left-right axis, and the head bone's world basis gives its
+        // forward. At azimuth 180 the camera looks down +Z from -Z, so a head
+        // facing the camera has forward ~= (0, 0, -1) and right ~= (-1, 0, 0).
+        // Logged in both the bind pose and the animated pose, the difference is
+        // the head's actual yaw.
+        if (scene.humanoids.GetCount() > 0)
+        {
+            using wi::scene::HumanoidComponent;
+            const HumanoidComponent& hum = scene.humanoids[0];
+
+            auto pos = [&](HumanoidComponent::HumanoidBone b, bool& valid) -> XMFLOAT3
+            {
+                const wi::ecs::Entity e = hum.bones[size_t(b)];
+                if (const wi::scene::TransformComponent* tr = scene.transforms.GetComponent(e))
+                {
+                    valid = true;
+                    return tr->GetPosition();
+                }
+                valid = false;
+                return XMFLOAT3(0, 0, 0);
+            };
+
+            bool okL = false, okR = false, okH = false;
+            const XMFLOAT3 L = pos(HumanoidComponent::HumanoidBone::LeftEye, okL);
+            const XMFLOAT3 R = pos(HumanoidComponent::HumanoidBone::RightEye, okR);
+            const XMFLOAT3 H = pos(HumanoidComponent::HumanoidBone::Head, okH);
+
+            wi::backlog::post("VRMPet: headbone pos=" + Fmt(H.x) + "," + Fmt(H.y) + "," + Fmt(H.z)
+                + "  lefteye_valid=" + std::to_string(okL)
+                + " righteye_valid=" + std::to_string(okR)
+                + " head_valid=" + std::to_string(okH));
+
+            // The look-at solver builds its target rotation in the head bone's
+            // own space, measuring against FORWARD = (0, 0, default_facing). That
+            // only works if the head bone's local +Z really is the direction the
+            // face points; when it is not, the solver drives the head the wrong
+            // way. default_facing is a heuristic the engine fills in from the
+            // shoulder rest positions, so it is worth seeing next to the head's
+            // actual axes.
+            wi::backlog::post("VRMPet: humanoid default_facing=" + Fmt(hum.default_facing)
+                + " knee_bending=" + Fmt(hum.knee_bending)
+                + " lookat_enabled=" + std::to_string(hum.IsLookAtEnabled() ? 1 : 0)
+                + " lookAt_target=" + Fmt(hum.lookAt.x) + "," + Fmt(hum.lookAt.y) + "," + Fmt(hum.lookAt.z));
+
+            if (okL && okR)
+            {
+                // Right-eye -> left-eye is the head's lateral axis. A head facing
+                // the camera has it along -X (the avatar faces -Z, so its left is
+                // -X in world space once the importer has turned it around).
+                const XMFLOAT3 axis = XMFLOAT3(L.x - R.x, L.y - R.y, L.z - R.z);
+                const float yaw = atan2f(axis.z, -axis.x) * 180.0f / XM_PI;
+                wi::backlog::post("VRMPet: eye axis=" + Fmt(axis.x) + "," + Fmt(axis.y) + "," + Fmt(axis.z)
+                    + "  |axis|=" + Fmt(sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z))
+                    + "  head_yaw=" + Fmt(yaw) + " deg");
+            }
+
+            if (const wi::scene::TransformComponent* htr =
+                    scene.transforms.GetComponent(hum.bones[size_t(HumanoidComponent::HumanoidBone::Head)]))
+            {
+                const XMFLOAT3 fwd = htr->GetForward();
+                const XMFLOAT3 rgt = htr->GetRight();
+                const XMFLOAT3 up  = htr->GetUp();
+                wi::backlog::post("VRMPet: head world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
+                    + " right=" + Fmt(rgt.x) + "," + Fmt(rgt.y) + "," + Fmt(rgt.z)
+                    + " up=" + Fmt(up.x) + "," + Fmt(up.y) + "," + Fmt(up.z));
+            }
+
+            if (const wi::scene::TransformComponent* ntr =
+                    scene.transforms.GetComponent(hum.bones[size_t(HumanoidComponent::HumanoidBone::Neck)]))
+            {
+                const XMFLOAT3 fwd = ntr->GetForward();
+                const XMFLOAT3 rgt = ntr->GetRight();
+                wi::backlog::post("VRMPet: neck world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
+                    + " right=" + Fmt(rgt.x) + "," + Fmt(rgt.y) + "," + Fmt(rgt.z));
+            }
+        }
 
         {
             const wi::scene::CameraComponent& cam = *path->camera;
@@ -920,11 +1367,31 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
             int base = 1;
             // Overlay mode has its own argument layout, since it has no output
             // directory and no focus/isolate options.
-            //   VRMPet.exe overlay [model.vrm] [azimuth] [msaa] [seconds]
+            //   VRMPet.exe overlay [model.vrm] [azimuth] [msaa] [seconds] [anim.vrma]
             if (argc > 1 && wcscmp(argv[1], L"overlay") == 0)
             {
                 g_overlayMode = true;
                 base = 2;
+                // The overlay exists to put a living character on the desktop, so
+                // it defaults to the idle loop. Capture mode defaults to no
+                // animation: its masks are differenced across frames - mask_user
+                // against mask_nostencil, mask_nostencil against background - and
+                // a character that moves between them would make them disagree.
+                // That is exactly the comparison REPORT.md sections 3 and 4 rest
+                // on, so the earlier numbers stay reproducible.
+                g_animPath = "assets/idle_loop.vrma";
+                // In overlay mode the camera IS the viewer's eye, so aiming the
+                // look-at solver at it is exactly "look at whoever is watching".
+                // Capture mode leaves it off: there the camera is a measuring
+                // instrument, and the pose should be the one the animation
+                // actually produces.
+                g_lookAtCamera = true;
+                // Azimuth 180 puts the camera on -Z, which is the side the
+                // importer turned the avatar to face. Azimuth 0 is the capture
+                // default and looks at the avatar's back - correct for reading a
+                // stencil mask, useless for a pet that is supposed to be looking
+                // at you.
+                g_azimuthDeg = 180.0f;
             }
 
             if (base == 2)
@@ -933,17 +1400,31 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                 if (argc > base + 1) g_azimuthDeg  = float(_wtof(argv[base + 1]));
                 if (argc > base + 2) g_msaa        = _wtoi(argv[base + 2]);
                 if (argc > base + 3) g_overlaySecs = _wtoi(argv[base + 3]);
+                if (argc > base + 4) g_animPath    = Narrow(argv[base + 4]);
             }
             else
             {
-                //   VRMPet.exe <out-dir> [model.vrm] [azimuth] [focus] [isolate] [msaa]
+                //   VRMPet.exe <out-dir> [model.vrm] [azimuth] [focus] [isolate] [msaa] [anim.vrma]
                 if (argc > 1) g_outDir      = Narrow(argv[1]);
                 if (argc > 2) g_modelPath   = Narrow(argv[2]);
                 if (argc > 3) g_azimuthDeg  = float(_wtof(argv[3]));
                 if (argc > 4) g_focusMesh   = _wtoi(argv[4]);
                 if (argc > 5) g_isolateMesh = _wtoi(argv[5]);
                 if (argc > 6) g_msaa        = _wtoi(argv[6]);
+                if (argc > 7) g_animPath    = Narrow(argv[7]);
             }
+
+            // Bare tokens anywhere on the command line, so they do not disturb the
+            // positional layout. Nothing can collide with them: every positional
+            // argument is a directory, a file path, or a number.
+            for (int i = 1; i < argc; ++i)
+            {
+                if (_wcsicmp(argv[i], L"lookat") == 0)
+                    g_lookAtCamera = true;
+                else if (_wcsicmp(argv[i], L"nolookat") == 0)
+                    g_lookAtCamera = false;
+            }
+
             LocalFree(argv);
         }
     }

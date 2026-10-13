@@ -78,5 +78,17 @@ add_custom_command(TARGET VRMPet POST_BUILD
     COMMENT "Staging dxcompiler.dll next to VRMPet.exe"
 )
 
+# The avatar and its idle loop are staged next to the executable too, so the
+# tool runs from build/run with no arguments. assets/ in the project root stays
+# the source of truth - this is a copy, and copy_if_different keeps it to a
+# single stat per build once the files are in place. Both are inputs, not build
+# output, so .gitignore tracks the originals and ignores build/ wholesale.
+add_custom_command(TARGET VRMPet POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+            "${VRMPET_RUNDIR}/assets"
+    COMMENT "Staging assets/ next to VRMPet.exe"
+)
+
 # Content/ is 489 MB and only holds sample assets the prototype does not need.
-# The VRM is loaded from an absolute path instead.
+# The avatar is loaded from assets/ instead.
