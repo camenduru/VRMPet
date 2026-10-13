@@ -1,0 +1,21 @@
+# ---------------------------------------------------------------------------
+# VRMPet
+#
+# Two things here have to survive a clone with the exact bytes they have now.
+#
+# 1. third_party/wicked_importer/ModelImporter_GLTF.cpp is a byte-for-byte copy
+#    of WickedEngine/Editor/ModelImporter_GLTF.cpp. REPORT.md section 4.4 cites
+#    its sha256 as the guarantee that the importer this tool builds against is
+#    the engine's own, unmodified. Git for Windows ships core.autocrlf=true by
+#    default, which rewrites LF to CRLF on checkout and would silently
+#    invalidate that hash on every machine but this one. -text keeps it away
+#    from the file.
+#
+# 2. assets/ holds the avatar and its idle loop. Git detects these as binary and
+#    leaves them alone, but saying so makes the intent explicit rather than
+#    relying on detection.
+# ---------------------------------------------------------------------------
+
+third_party/wicked_importer/**  -text
+
+assets/**                       binary

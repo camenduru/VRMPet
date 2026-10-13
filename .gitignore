@@ -2,9 +2,15 @@
 # VRMPet
 #
 # Source that IS tracked: CMakeLists.txt, build.sh, REPORT.md, src/, tools/,
-# and third_party/wicked_importer/ (that last one is a deliberate byte-for-byte
-# copy of the engine's Editor/ModelImporter_GLTF.cpp - see REPORT.md section
-# 4.4 - so it must stay in the repository).
+# assets/, and third_party/wicked_importer/.
+#
+#   * third_party/wicked_importer/ is a deliberate byte-for-byte copy of the
+#     engine's Editor/ModelImporter_GLTF.cpp - see REPORT.md section 4.4 - so it
+#     must stay in the repository. .gitattributes keeps line endings away from
+#     it so the copy really is byte-for-byte on every machine.
+#   * assets/ holds the avatar and its idle loop. These are INPUTS, not build
+#     output: they are what the tool is a tool for. The copies CMake stages into
+#     build/run/assets/ are derived, and build/ is ignored wholesale.
 #
 # Everything else below is generated.
 # ---------------------------------------------------------------------------
@@ -12,9 +18,10 @@
 # ---------------------------------------------------------------------------
 # Build tree
 # ---------------------------------------------------------------------------
-# build.sh configures into build/ and copies VRMPet.exe, dxcompiler.dll and the
-# compiled shaders into build/run/. All of it is derived: CMakeCache.txt, the
-# Ninja files, object files, and every capture the tool produces.
+# build.sh configures into build/ and copies VRMPet.exe, dxcompiler.dll, the
+# compiled shaders and assets/ into build/run/. All of it is derived:
+# CMakeCache.txt, the Ninja files, object files, and every capture the tool
+# produces.
 build/
 build-*/
 cmake-build-*/
@@ -60,8 +67,11 @@ compile_commands.json
 # Capture output
 # ---------------------------------------------------------------------------
 # VRMPet.exe writes these into its output directory, and the tools in tools/
-# write the derived images next to them. Named individually rather than with a
-# blanket *.png, so a screenshot that is worth keeping can still be committed.
+# write the derived images next to them. This is belt and braces: the tool is
+# normally run from build/run, which is ignored wholesale above. The names are
+# listed individually rather than with a blanket *.png so a screenshot that is
+# worth keeping can still be committed - the side-by-side comparisons in
+# REPORT.md are exactly that, and they live in docs/ instead.
 mask_default.png
 mask_user.png
 mask_nostencil.png
@@ -77,6 +87,30 @@ mask_user_head.png
 mask_default_over_checker.png
 mask_user_over_checker.png
 head_composite_vs_truth.png
+
+# Desktop grabs and the comparisons built from them, for anyone who runs the
+# tool from the project root rather than from build/run.
+desktop*.png
+anim_*.png
+final_*.png
+*_compare.png
+overlay_motion.png
+head_compare.png
+
+# Scratch directories the verification runs write into.
+animoff/
+animon/
+front_off/
+front_on/
+headoff/
+headon/
+headoff2/
+headon2/
+lookat_on/
+lk/
+m_off/
+m_on/
+m_onlk/
 
 # ---------------------------------------------------------------------------
 # Editors and OS

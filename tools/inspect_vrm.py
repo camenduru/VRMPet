@@ -109,14 +109,26 @@ def inspect(path):
         hr("VRMC_springBone block  (top level, VRM 1.0)")
         sb = top["VRMC_springBone"]
         print(f"specVersion  : {sb.get('specVersion')}")
-        groups = sb.get("springBones", [])
-        print(f"spring groups: {len(groups)}")
+        # The released VRM 1.0 spec calls the array "springs". Early drafts and
+        # several exporters used "springBones". Reading only one of the two
+        # silently reports zero springs on a model that has plenty, which is
+        # exactly the kind of thing that makes a hair simulation look like it is
+        # not running.
+        groups = sb.get("springs")
+        if groups is None:
+            groups = sb.get("springBones", [])
+            key = "springBones"
+        else:
+            key = "springs"
+        print(f"spring array : '{key}'  ({len(groups)} entries)")
         total_joints = sum(len(g.get("joints", [])) for g in groups)
         print(f"spring joints: {total_joints}")
         print(f"colliders    : {len(sb.get('colliders', []))}")
+        print(f"colliderGroups: {len(sb.get('colliderGroups', []))}")
         for g in groups[:20]:
             print(f"  - {len(g.get('joints', [])):>3} joints  "
-                  f"stiffness={g.get('stiffness')} drag={g.get('dragForce')}")
+                  f"stiffness={g.get('stiffness')} drag={g.get('dragForce')} "
+                  f"hitRadius={g.get('hitRadius')}")
 
     if "VRMC_vrm_animation" in top:
         hr("VRMC_vrm_animation block")
