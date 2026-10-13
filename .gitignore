@@ -1,9 +1,12 @@
 # ---------------------------------------------------------------------------
 # VRMPet
 #
-# Source that IS tracked: CMakeLists.txt, build.sh, REPORT.md, src/, tools/,
-# assets/, and third_party/wicked_importer/.
+# Source that IS tracked: CMakeLists.txt, build.sh, REPORT.md, docs/, src/,
+# tools/, assets/, and third_party/wicked_importer/.
 #
+#   * docs/ holds the rendered comparisons REPORT.md embeds. Those images are
+#     tracked - a clone without them shows five broken images - but the one
+#     working document that lives there is not. See the last section.
 #   * third_party/wicked_importer/ is a deliberate byte-for-byte copy of the
 #     engine's Editor/ModelImporter_GLTF.cpp - see REPORT.md section 4.4 - so it
 #     must stay in the repository. .gitattributes keeps line endings away from
@@ -119,6 +122,25 @@ lk/
 m_off/
 m_on/
 m_onlk/
+
+# ---------------------------------------------------------------------------
+# Working documents
+# ---------------------------------------------------------------------------
+# A design document is a working document: a plan, written to be revised or
+# thrown away, not an artifact of the tool. It is kept on disk so it can be
+# read and edited, and deliberately kept out of the repository so a plan that
+# changes its mind does not leave a trail in the history. REPORT.md is the
+# opposite - it records what was measured and is meant to be committed.
+#
+# The path is given in full rather than as `docs/*.md` on purpose: if a second
+# design document is ever worth committing, this line should be reconsidered
+# deliberately rather than silently catching it.
+#
+# NOTE: docs/ itself is NOT ignored. The five PNGs there are rendered engine
+# output and REPORT.md embeds them by name. Ignoring the directory would break
+# every one of those images in a fresh clone - which is exactly the mistake
+# this note exists to prevent.
+docs/DESIGN-voice-and-chat.md
 
 # ---------------------------------------------------------------------------
 # Editors and OS
