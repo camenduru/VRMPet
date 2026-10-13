@@ -14,13 +14,19 @@
 //
 //  Uses only public WickedEngine API. Nothing in the engine is modified.
 //
-//  usage: VRMPet.exe [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa]
+//  Capture mode - writes PNGs for analysis:
+//    VRMPet.exe [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa]
+//
+//  Overlay mode - the avatar standing on the desktop, no window, no background:
+//    VRMPet.exe overlay [model.vrm] [azimuth-deg] [msaa] [seconds]
+//      azimuth 180 faces the camera. seconds 0 = run until Ctrl+Shift+Q.
 // ---------------------------------------------------------------------------
 
 #include "WickedEngine.h"
 
 #include <shellapi.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -76,6 +82,161 @@ namespace
         snprintf(buf, sizeof(buf), "%.4f", v);
         return buf;
     }
+
+    // -----------------------------------------------------------------------
+    // Overlay mode
+    //
+    // The end goal: the avatar standing on the desktop, no background, no
+    // window, fully transparent. WickedEngine's own swap chain cannot carry
+    // alpha - GraphicsDevice_DX12::CreateSwapChain hardcodes
+    // DXGI_ALPHA_MODE_IGNORE - so the engine renders into a hidden window and
+    // the masked RGBA is pushed to a separate layered window instead.
+    //
+    // WS_POPUP          no caption, no border, no chrome at all
+    // WS_EX_LAYERED     required for UpdateLayeredWindow (per-pixel alpha)
+    // WS_EX_TRANSPARENT mouse input falls through to whatever is underneath
+    // WS_EX_TOOLWINDOW  keeps it out of the taskbar and Alt+Tab
+    // WS_EX_NOACTIVATE  never steals focus from the app you are working in
+    // WS_EX_TOPMOST     floats above other windows
+    // -----------------------------------------------------------------------
+    bool g_overlayMode   = false;
+    int  g_overlaySecs   = 0;   // 0 = run until Ctrl+Shift+Q
+    int  g_overlayMargin = 0;   // gap between the character and the work-area edge
+
+    // Frames to render before the first blit, so spring bones and temporal
+    // effects have settled and the character is not captured mid-twitch.
+    constexpr int kOverlaySettleFrames = 30;
+
+    struct LayeredOverlay
+    {
+        HWND     hwnd = nullptr;
+        HDC      dc   = nullptr;
+        HBITMAP  bmp  = nullptr;
+        uint8_t* bits = nullptr;   // BGRA, premultiplied, top-down
+        int      w = 0;
+        int      h = 0;
+        int      x = 0;
+        int      y = 0;
+
+        bool Create(int width, int height, int posX, int posY)
+        {
+            w = width;
+            h = height;
+            x = posX;
+            y = posY;
+
+            HINSTANCE inst = GetModuleHandleW(nullptr);
+
+            WNDCLASSEXW wc = {};
+            wc.cbSize        = sizeof(wc);
+            wc.lpfnWndProc   = OverlayProc;
+            wc.hInstance     = inst;
+            wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+            wc.lpszClassName = L"VRMPetOverlay";
+            RegisterClassExW(&wc);
+
+            hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+                WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                wc.lpszClassName, L"VRMPet",
+                WS_POPUP,
+                x, y, w, h,
+                nullptr, nullptr, inst, nullptr);
+            if (hwnd == nullptr)
+                return false;
+
+            HDC screen = GetDC(nullptr);
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth       = w;
+            bmi.bmiHeader.biHeight      = -h;   // negative = top-down, matching the readback
+            bmi.bmiHeader.biPlanes      = 1;
+            bmi.bmiHeader.biBitCount    = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0);
+            if (bmp == nullptr)
+            {
+                ReleaseDC(nullptr, screen);
+                return false;
+            }
+            dc = CreateCompatibleDC(screen);
+            ReleaseDC(nullptr, screen);
+            if (dc == nullptr)
+                return false;
+            SelectObject(dc, bmp);
+
+            return true;
+        }
+
+        void Show()
+        {
+            if (hwnd == nullptr)
+                return;
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+
+        // Crop the avatar's box out of the engine's RGBA readback, premultiply it,
+        // and write it as BGRA. UpdateLayeredWindow with AC_SRC_ALPHA requires the
+        // colour channels to already be multiplied by alpha.
+        void Blit(const uint8_t* rgba, int srcW, int cropX, int cropY)
+        {
+            if (bits == nullptr)
+                return;
+            for (int row = 0; row < h; ++row)
+            {
+                const uint8_t* src = rgba + (size_t(cropY + row) * size_t(srcW) + size_t(cropX)) * 4;
+                uint8_t* dst = bits + size_t(row) * size_t(w) * 4;
+                for (int col = 0; col < w; ++col)
+                {
+                    const uint8_t r = src[0];
+                    const uint8_t g = src[1];
+                    const uint8_t b = src[2];
+                    const uint8_t a = src[3];
+                    dst[0] = uint8_t(b * a / 255);
+                    dst[1] = uint8_t(g * a / 255);
+                    dst[2] = uint8_t(r * a / 255);
+                    dst[3] = a;
+                    src += 4;
+                    dst += 4;
+                }
+            }
+        }
+
+        void Push()
+        {
+            if (hwnd == nullptr || dc == nullptr)
+                return;
+            POINT dstPt = { x, y };
+            POINT srcPt = { 0, 0 };
+            SIZE  size  = { w, h };
+            BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+            UpdateLayeredWindow(hwnd, nullptr, &dstPt, &size, dc, &srcPt, 0, &bf, ULW_ALPHA);
+        }
+
+        static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+        {
+            switch (msg)
+            {
+            case WM_NCHITTEST:
+                return HTTRANSPARENT;   // belt and braces alongside WS_EX_TRANSPARENT
+            case WM_HOTKEY:
+                if (wParam == 1)
+                {
+                    wi::backlog::post("VRMPet: overlay hotkey - quitting");
+                    wi::backlog::Flush();
+                    PostQuitMessage(0);
+                }
+                return 0;
+            case WM_DESTROY:
+                PostQuitMessage(0);
+                return 0;
+            default:
+                return DefWindowProcW(hWnd, msg, wParam, lParam);
+            }
+        }
+    };
+
+    LayeredOverlay g_overlay;
 }
 
 class PetApp : public wi::Application
@@ -95,6 +256,14 @@ public:
     wi::RenderPath3D* path  = nullptr;
     Stage             stage = Stage::WaitForInit;
     int               counter = 0;
+
+    // Overlay mode state
+    bool overlayReady   = false;
+    int  overlaySettle  = 0;
+    bool overlayCreated = false;
+    int  cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+    long long overlayFrames = 0;
+    std::chrono::steady_clock::time_point overlayClock;
 
     void Initialize() override
     {
@@ -156,6 +325,12 @@ public:
 
         ActivatePath(path, 0.0f);
 
+        // In overlay mode every frame ends with a readback and a blit to the
+        // layered window. Run() invokes this right after Present, with the GPU
+        // idle and no render pass open - the only safe point to touch the
+        // textures we capture from.
+        onFrameComplete = [this]() { OnFrameComplete(); };
+
         wi::backlog::post("VRMPet: probe post-path path cam near=" + Fmt(path->camera->zNearP)
             + " far=" + Fmt(path->camera->zFarP)
             + " fov=" + Fmt(path->camera->fov)
@@ -167,6 +342,12 @@ public:
     void Update(float dt) override
     {
         wi::Application::Update(dt);
+
+        if (g_overlayMode)
+        {
+            UpdateOverlay();
+            return;
+        }
 
         switch (stage)
         {
@@ -245,6 +426,129 @@ public:
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // Overlay mode
+    // -----------------------------------------------------------------------
+    void UpdateOverlay()
+    {
+        if (!overlayReady)
+        {
+            if (!wi::initializer::IsInitializeFinished())
+                return;
+            LoadModel();
+            FrameCamera();
+            overlayReady = true;
+            return;
+        }
+
+        // Nothing to do here - the capture happens in OnFrameComplete(), after
+        // the frame has been rendered and presented. This only counts frames.
+        ++overlaySettle;
+    }
+
+    void OnFrameComplete()
+    {
+        if (!g_overlayMode || !overlayReady || overlaySettle < kOverlaySettleFrames)
+            return;
+        CaptureAndBlit();
+    }
+
+    // Tight box around everything with non-zero alpha. Used once, to size the
+    // overlay window to the character rather than to the whole 1024x1024 frame.
+    bool ComputeCropBox(const uint8_t* rgba, int w, int h)
+    {
+        int minX = w, minY = h, maxX = -1, maxY = -1;
+        for (int y = 0; y < h; ++y)
+        {
+            const uint8_t* row = rgba + size_t(y) * size_t(w) * 4;
+            for (int x = 0; x < w; ++x)
+            {
+                if (row[size_t(x) * 4 + 3] != 0)
+                {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (maxX < minX || maxY < minY)
+            return false;
+
+        cropX = minX;
+        cropY = minY;
+        cropW = maxX - minX + 1;
+        cropH = maxY - minY + 1;
+        return true;
+    }
+
+    void CaptureAndBlit()
+    {
+        // Same call the analysis tool uses: STENCILMODE_NOT against stencil 0
+        // keeps every pixel the scene rasterised and drops the cleared sky.
+        wi::graphics::Texture tex = path->CreateScreenshotWithAlphaBackground(
+            wi::enums::STENCILREF_EMPTY, wi::image::STENCILMODE_NOT, wi::image::STENCILREFMODE_ALL);
+
+        wi::vector<uint8_t> rgba;
+        if (!wi::helper::saveTextureToMemory(tex, rgba))
+        {
+            wi::backlog::post("VRMPet: overlay readback FAILED");
+            wi::backlog::Flush();
+            return;
+        }
+
+        const int w = (int)tex.desc.width;
+        const int h = (int)tex.desc.height;
+        if (w <= 0 || h <= 0 || rgba.size() < size_t(w) * size_t(h) * 4)
+            return;
+
+        if (!overlayCreated)
+        {
+            if (!ComputeCropBox(rgba.data(), w, h))
+                return;   // nothing rendered yet; try again next frame
+
+            RECT wa = {};
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            const int px = wa.right - cropW - g_overlayMargin;
+            const int py = wa.bottom - cropH - g_overlayMargin;
+
+            if (!g_overlay.Create(cropW, cropH, px, py))
+            {
+                wi::backlog::post("VRMPet: overlay window creation FAILED");
+                wi::backlog::Flush();
+                return;
+            }
+            g_overlay.Show();
+
+            wi::backlog::post("VRMPet: overlay window " + std::to_string(cropW) + "x"
+                + std::to_string(cropH) + " at " + std::to_string(px) + ","
+                + std::to_string(py) + "  (work area "
+                + std::to_string(wa.right - wa.left) + "x" + std::to_string(wa.bottom - wa.top)
+                + ", crop from " + std::to_string(cropX) + "," + std::to_string(cropY) + ")");
+            wi::backlog::Flush();
+
+            overlayCreated = true;
+            overlayClock = std::chrono::steady_clock::now();
+        }
+
+        g_overlay.Blit(rgba.data(), w, cropX, cropY);
+        g_overlay.Push();
+
+        ++overlayFrames;
+        const double elapsed =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - overlayClock).count();
+        if (elapsed >= 5.0)
+        {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "VRMPet: overlay %.1f fps over %.0fs (%lld frames)",
+                     double(overlayFrames) / elapsed, elapsed, overlayFrames);
+            wi::backlog::post(buf);
+            wi::backlog::Flush();
+            overlayFrames = 0;
+            overlayClock = std::chrono::steady_clock::now();
+        }
+    }
+
     void LoadModel()
     {
         wi::scene::Scene& scene = wi::scene::GetScene();
@@ -321,12 +625,16 @@ private:
         // Control object: an unskinned primitive with a default material, parked
         // beside the avatar's head. If the probe shows up in the stencil mask but
         // the avatar does not, the render path is fine and the fault is specific
-        // to the imported skinned meshes.
-        const wi::ecs::Entity probe = scene.Entity_CreateSphere("stencil_probe", 0.12f);
-        if (wi::scene::TransformComponent* tr = scene.transforms.GetComponent(probe))
+        // to the imported skinned meshes. Skipped in overlay mode, where a stray
+        // sphere floating next to the character would be a bug, not a diagnostic.
+        if (!g_overlayMode)
         {
-            tr->translation_local = XMFLOAT3(0.75f, 1.25f, 0.25f);
-            tr->SetDirty();
+            const wi::ecs::Entity probe = scene.Entity_CreateSphere("stencil_probe", 0.12f);
+            if (wi::scene::TransformComponent* tr = scene.transforms.GetComponent(probe))
+            {
+                tr->translation_local = XMFLOAT3(0.75f, 1.25f, 0.25f);
+                tr->SetDirty();
+            }
         }
 
         // Isolation mode. mesh[0] is the face, and its 8 subsets are exactly the 8
@@ -609,12 +917,33 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
         if (argv != nullptr)
         {
-            if (argc > 1) g_outDir      = Narrow(argv[1]);
-            if (argc > 2) g_modelPath   = Narrow(argv[2]);
-            if (argc > 3) g_azimuthDeg  = float(_wtof(argv[3]));
-            if (argc > 4) g_focusMesh   = _wtoi(argv[4]);
-            if (argc > 5) g_isolateMesh = _wtoi(argv[5]);
-            if (argc > 6) g_msaa        = _wtoi(argv[6]);
+            int base = 1;
+            // Overlay mode has its own argument layout, since it has no output
+            // directory and no focus/isolate options.
+            //   VRMPet.exe overlay [model.vrm] [azimuth] [msaa] [seconds]
+            if (argc > 1 && wcscmp(argv[1], L"overlay") == 0)
+            {
+                g_overlayMode = true;
+                base = 2;
+            }
+
+            if (base == 2)
+            {
+                if (argc > base + 0) g_modelPath   = Narrow(argv[base + 0]);
+                if (argc > base + 1) g_azimuthDeg  = float(_wtof(argv[base + 1]));
+                if (argc > base + 2) g_msaa        = _wtoi(argv[base + 2]);
+                if (argc > base + 3) g_overlaySecs = _wtoi(argv[base + 3]);
+            }
+            else
+            {
+                //   VRMPet.exe <out-dir> [model.vrm] [azimuth] [focus] [isolate] [msaa]
+                if (argc > 1) g_outDir      = Narrow(argv[1]);
+                if (argc > 2) g_modelPath   = Narrow(argv[2]);
+                if (argc > 3) g_azimuthDeg  = float(_wtof(argv[3]));
+                if (argc > 4) g_focusMesh   = _wtoi(argv[4]);
+                if (argc > 5) g_isolateMesh = _wtoi(argv[5]);
+                if (argc > 6) g_msaa        = _wtoi(argv[6]);
+            }
             LocalFree(argv);
         }
     }
@@ -633,6 +962,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
             break;
         case WM_SETFOCUS:
             app.is_window_active = true;
+            break;
+        case WM_HOTKEY:
+            if (wParam == 1)
+                PostQuitMessage(0);
             break;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -655,13 +988,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     wcex.lpszClassName = L"VRMPetWindowClass";
     RegisterClassExW(&wcex);
 
-    RECT rc = { 0, 0, kWindowSize, kWindowSize };
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    HWND hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet - capture prototype",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-        rc.right - rc.left, rc.bottom - rc.top,
-        nullptr, nullptr, hInstance, nullptr);
-    ShowWindow(hWnd, SW_SHOWDEFAULT);
+    HWND hWnd = nullptr;
+    if (g_overlayMode)
+    {
+        // The engine's window is only a render target here. It is never shown -
+        // everything the user sees goes through the layered overlay window, which
+        // g_overlay creates once the character's bounding box is known. The
+        // engine's own swap chain is irrelevant: RenderPath3D draws into its own
+        // textures, so the render is correct even though nothing is ever
+        // presented to a visible window.
+        hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet (engine, hidden)",
+            WS_POPUP, 0, 0, kWindowSize, kWindowSize,
+            nullptr, nullptr, hInstance, nullptr);
+    }
+    else
+    {
+        RECT rc = { 0, 0, kWindowSize, kWindowSize };
+        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+        hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet - capture prototype",
+            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+            rc.right - rc.left, rc.bottom - rc.top,
+            nullptr, nullptr, hInstance, nullptr);
+        ShowWindow(hWnd, SW_SHOWDEFAULT);
+    }
+
+    if (hWnd == nullptr)
+    {
+        MessageBoxW(nullptr, L"Could not create the window.", L"VRMPet", MB_ICONERROR);
+        return 1;
+    }
 
     app.SetWindow(hWnd);
 
@@ -669,10 +1024,24 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     // A capture tool must keep rendering even when the window is not focused -
     // this process is launched from a background shell and never receives
-    // WM_SETFOCUS, and Application::Run() returns early when inactive.
+    // WM_SETFOCUS, and Application::Run() returns early when inactive. In overlay
+    // mode the engine window is never shown at all, so this is the only thing
+    // keeping the render loop alive.
     app.is_window_active = true;
 
+    if (g_overlayMode)
+    {
+        // The overlay is click-through and has no taskbar button, so without a
+        // global hotkey there would be no way to close it.
+        if (!RegisterHotKey(hWnd, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'Q'))
+        {
+            wi::backlog::post("VRMPet: WARNING - could not register Ctrl+Shift+Q");
+            wi::backlog::Flush();
+        }
+    }
+
     MSG msg = {};
+    const auto startTime = std::chrono::steady_clock::now();
     while (msg.message != WM_QUIT)
     {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -682,10 +1051,25 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         }
         else
         {
+            if (g_overlayMode && g_overlaySecs > 0)
+            {
+                const double elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - startTime).count();
+                if (elapsed >= double(g_overlaySecs))
+                {
+                    wi::backlog::post("VRMPet: overlay reached its "
+                        + std::to_string(g_overlaySecs) + "s limit - quitting");
+                    wi::backlog::Flush();
+                    break;
+                }
+            }
             app.is_window_active = true;
             app.Run();
         }
     }
+
+    if (g_overlayMode)
+        UnregisterHotKey(hWnd, 1);
 
     wi::jobsystem::ShutDown();
     return (int)msg.wParam;
