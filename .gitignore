@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# VRMPet
+#
+# Source that IS tracked: CMakeLists.txt, build.sh, REPORT.md, src/, tools/,
+# and third_party/wicked_importer/ (that last one is a deliberate byte-for-byte
+# copy of the engine's Editor/ModelImporter_GLTF.cpp - see REPORT.md section
+# 4.4 - so it must stay in the repository).
+#
+# Everything else below is generated.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Build tree
+# ---------------------------------------------------------------------------
+# build.sh configures into build/ and copies VRMPet.exe, dxcompiler.dll and the
+# compiled shaders into build/run/. All of it is derived: CMakeCache.txt, the
+# Ninja files, object files, and every capture the tool produces.
+build/
+build-*/
+cmake-build-*/
+
+# build.sh writes its full transcript here.
+build_vrmpet.txt
+
+# ---------------------------------------------------------------------------
+# CMake
+# ---------------------------------------------------------------------------
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+
+# ---------------------------------------------------------------------------
+# MSVC / Windows toolchain
+# ---------------------------------------------------------------------------
+*.obj
+*.o
+*.exe
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.res
+*.tlog
+*.lastbuildstate
+*.log
+
+# Generated Visual Studio project files, for anyone who configures with -G VS.
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# ---------------------------------------------------------------------------
+# Capture output
+# ---------------------------------------------------------------------------
+# VRMPet.exe writes these into its output directory, and the tools in tools/
+# write the derived images next to them. Named individually rather than with a
+# blanket *.png, so a screenshot that is worth keeping can still be committed.
+mask_default.png
+mask_user.png
+mask_nostencil.png
+background.png
+color.png
+engine.log
+log.txt
+run.log
+diff_full.png
+diff_head.png
+mask_default_head.png
+mask_user_head.png
+mask_default_over_checker.png
+mask_user_over_checker.png
+head_composite_vs_truth.png
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
