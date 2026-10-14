@@ -33,18 +33,47 @@
 //  camera is the viewer's eye there, so the pet watches whoever is looking at
 //  the screen - and off in capture mode, where the pose should be exactly the
 //  one the animation produces.
+//
+//  Talking, in overlay mode (see docs/DESIGN-voice-and-chat.md, option A):
+//
+//    mic  -> POST /v1/asr   -> the agent's own LLM (no extra LLM)
+//         -> POST /v1/tts   -> wi::audio -> the mouth
+//
+//  Messages appear in a speech bubble composited into the same layered window,
+//  so there is no second window and no separate log. Ctrl+Shift+V pastes the
+//  clipboard as a chat message, Ctrl+Shift+H widens the transcript band,
+//  Ctrl+Shift+M mutes the microphone, Ctrl+Shift+Q still quits.
+//
+//  Each leg also has a command-line probe that runs before the engine starts, so
+//  a failure has one possible cause:
+//
+//    VRMPet.exe agent "hello"      one turn through the agent, text only
+//    VRMPet.exe asr out/turn.wav   a wav through speech-to-text
+//    VRMPet.exe tts "hello"        one line of speech as wav + validation
+//    VRMPet.exe mic 10             the microphone and the speech gate, no network
+//    VRMPet.exe bubble "hello"     the bubble band alone, written to a BMP
+//    VRMPet.exe ask "hello"        overlay + one scripted turn, then quit
 // ---------------------------------------------------------------------------
 
 #include "WickedEngine.h"
 
 #include <shellapi.h>
 
+#include "bubble.h"
+#include "fish.h"
+#include "petcall.h"
+#include "util.h"
+#include "voice.h"
+
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <functional>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <vector>
 
 // Declared in WickedEngine/Editor/ModelImporter.h. The engine library exports no
 // model importer - wi::scene::LoadModel() only understands the .wiscene Archive
@@ -93,17 +122,12 @@ namespace
     // "nolookat" token on the command line.
     bool g_lookAtCamera = false;
 
-    std::string Narrow(const wchar_t* wide)
-    {
-        if (wide == nullptr)
-            return {};
-        const int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
-        if (len <= 1)
-            return {};
-        std::string out(size_t(len - 1), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
-        return out;
-    }
+    // String helpers and the logger live in vrmpet:: (src/util.{h,cpp}) because
+    // the voice modules need exactly the same ones. Narrow() takes a wchar_t*
+    // here and a std::wstring there; both bind to an LPWSTR argument.
+    using vrmpet::Fmt;
+    using vrmpet::Log;
+    std::string Narrow(const wchar_t* wide) { return vrmpet::Narrow(wide == nullptr ? std::wstring() : std::wstring(wide)); }
 
     std::string JoinPath(std::string dir, const std::string& rel)
     {
@@ -182,13 +206,6 @@ namespace
             || GetLastError() == ERROR_ALREADY_EXISTS;
     }
 
-    std::string Fmt(float v)
-    {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%.4f", v);
-        return buf;
-    }
-
     // -----------------------------------------------------------------------
     // Overlay mode
     //
@@ -209,6 +226,28 @@ namespace
     int  g_overlaySecs   = 0;   // 0 = run until Ctrl+Shift+Q
     int  g_overlayMargin = 0;   // gap between the character and the work-area edge
 
+    // -----------------------------------------------------------------------
+    // The bubble band, and why the canvas is bigger than the avatar
+    //
+    // The window's bottom-right corner is pinned to the work area and the canvas
+    // grows *left and up* to hold the band. The avatar therefore lands on exactly
+    // the pixel it used to: px + avatarX == wa.right - cropW - g_overlayMargin.
+    // The band is measured once, before the window exists, and never resized -
+    // the same rule kOverlayPad follows for the avatar itself.
+    // -----------------------------------------------------------------------
+    constexpr int kOverlayGap      = 24;    // between the band and the avatar
+    constexpr int kBubbleBandWidth = 420;
+    constexpr int kBubbleBandHeight = 214;  // 4 one-line bubbles + status + tail
+
+    // Voice and chat. The transport is built by PetApp::StartVoice(), which is
+    // the only place that knows a network exists.
+    std::string g_askText;                  // "ask" mode: one scripted turn, then quit
+    std::string g_probeMode;                // agent | asr | tts | mic | bubble
+    std::string g_probeArg;
+    int         g_probeSeconds = 6;
+    float       g_mouthGain = 1.0f;
+    bool        g_micEnabled = true;
+
     // Frames to render before the first blit, so spring bones and temporal
     // effects have settled and the character is not captured mid-twitch.
     constexpr int kOverlaySettleFrames = 30;
@@ -220,6 +259,12 @@ namespace
     // hand quietly losing its fingers at the window edge.
     constexpr int kOverlayPad         = 40;
     constexpr int kOverlayCheckFrames = 60;
+
+    // Set by PetApp once the overlay window exists. The hotkeys are registered
+    // on that window, so its window proc is where they arrive - and the proc is
+    // a static member of the struct below, which cannot see the instance that is
+    // declared after it.
+    std::function<void(int)> g_overlayHotkey;
 
     struct LayeredOverlay
     {
@@ -292,15 +337,20 @@ namespace
         // Crop the avatar's box out of the engine's RGBA readback, premultiply it,
         // and write it as BGRA. UpdateLayeredWindow with AC_SRC_ALPHA requires the
         // colour channels to already be multiplied by alpha.
-        void Blit(const uint8_t* rgba, int srcW, int cropX, int cropY)
+        // dstX/dstY place the avatar inside the composited canvas rather than at
+        // (0, 0). Only the avatar's rows and columns are touched, which is what
+        // leaves the bubble band above it exactly as the bubble drew it - so the
+        // bubble costs one composite per turn, not one per frame.
+        void Blit(const uint8_t* rgba, int srcW, int cropX, int cropY,
+                  int cropW, int cropH, int dstX, int dstY)
         {
             if (bits == nullptr)
                 return;
-            for (int row = 0; row < h; ++row)
+            for (int row = 0; row < cropH; ++row)
             {
                 const uint8_t* src = rgba + (size_t(cropY + row) * size_t(srcW) + size_t(cropX)) * 4;
-                uint8_t* dst = bits + size_t(row) * size_t(w) * 4;
-                for (int col = 0; col < w; ++col)
+                uint8_t* dst = bits + (size_t(dstY + row) * size_t(w) + size_t(dstX)) * 4;
+                for (int col = 0; col < cropW; ++col)
                 {
                     const uint8_t r = src[0];
                     const uint8_t g = src[1];
@@ -340,6 +390,10 @@ namespace
                     wi::backlog::Flush();
                     PostQuitMessage(0);
                 }
+                else if (g_overlayHotkey)
+                {
+                    g_overlayHotkey(int(wParam));
+                }
                 return 0;
             case WM_DESTROY:
                 PostQuitMessage(0);
@@ -351,6 +405,342 @@ namespace
     };
 
     LayeredOverlay g_overlay;
+
+    // -----------------------------------------------------------------------
+    // Small Win32 helpers the voice feature needs
+    // -----------------------------------------------------------------------
+
+    // Ctrl+Shift+V is the typed-input path. The overlay is click-through and
+    // never takes focus, so there is nowhere to type into - composing in any
+    // editor and pasting is both the honest answer to "chat" and the one that
+    // needs no focusable surface.
+    std::string ReadClipboardText()
+    {
+        std::string text;
+        if (!OpenClipboard(nullptr))
+            return text;
+        if (HANDLE handle = GetClipboardData(CF_UNICODETEXT))
+        {
+            if (const wchar_t* raw = (const wchar_t*)GlobalLock(handle))
+            {
+                text = vrmpet::Narrow(std::wstring(raw));
+                GlobalUnlock(handle);
+            }
+        }
+        CloseClipboard();
+        return text;
+    }
+
+    std::vector<std::string> EnvDirs()
+    {
+        const std::string exeDir = vrmpet::ExeDirectory();
+        return {
+            vrmpet::WorkingDirectory(),
+            exeDir,
+            JoinPath(exeDir, ".."),
+            JoinPath(exeDir, "../.."),
+            JoinPath(exeDir, "../../.."),
+        };
+    }
+
+    bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out)
+    {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr)
+            return false;
+        std::fseek(f, 0, SEEK_END);
+        const long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (size <= 0)
+        {
+            std::fclose(f);
+            return false;
+        }
+        out.resize(size_t(size));
+        const size_t read = std::fread(out.data(), 1, out.size(), f);
+        std::fclose(f);
+        out.resize(read);
+        return read == size_t(size);
+    }
+
+    // -----------------------------------------------------------------------
+    // Probes
+    //
+    // Each one runs before the engine starts - no window, no GPU, no shader
+    // compilation - and exercises exactly one leg of the pipeline, so a failure
+    // has one possible cause. This is the staged plan from the design document
+    // turned into commands, and it is also how the parts were verified here:
+    // the microphone could be checked without the network, the network without
+    // the microphone, and the bubble without either.
+    //
+    // Returns a process exit code: 0 pass, 1 fail, 2 unusable.
+    // -----------------------------------------------------------------------
+    int RunProbe(const std::string& outDir)
+    {
+        using namespace vrmpet;
+
+        EnsureDirectory(outDir);
+        wi::backlog::SetLogFile(outDir + "/probe.log");
+        Log("VRMPet: probe '" + g_probeMode + "' -> " + outDir);
+
+        // --- the microphone, and nothing else -------------------------------
+        if (g_probeMode == "mic")
+        {
+            int utterances = 0;
+            double speechSeconds = 0.0;
+            float loudest = 0.0f;
+            float lastUtteranceRms = 0.0f;
+
+            MicCapture mic;
+            mic.Start(
+                [&](Utterance utterance)
+                {
+                    ++utterances;
+                    speechSeconds += utterance.seconds;
+                    lastUtteranceRms = utterance.rms;
+                },
+                nullptr);
+
+            const double end = NowSeconds() + double(g_probeSeconds);
+            double nextLevel = NowSeconds() + 0.5;
+            while (NowSeconds() < end)
+            {
+                const float level = mic.Level();
+                if (level > loudest)
+                    loudest = level;
+                if (NowSeconds() >= nextLevel)
+                {
+                    nextLevel += 0.5;
+                    Log("VRMPet:   level " + Fmt(level, 4));
+                }
+                Sleep(20);
+            }
+            mic.Stop();
+
+            const MicStatus status = mic.Status();
+            Log("VRMPet: probe mic - endpoints " + std::to_string(status.devices)
+                + ", opened " + (status.opened ? "yes" : "NO")
+                + ", device '" + status.deviceName + "'");
+            if (status.opened)
+            {
+                Log("VRMPet: probe mic - source " + std::to_string(status.sourceRate)
+                    + " Hz -> 16000 Hz" + (status.resampled ? " (converted in-process)" : ""));
+            }
+            else if (!status.error.empty())
+            {
+                Log("VRMPet: probe mic - " + status.error);
+            }
+            Log("VRMPet: probe mic - loudest frame " + Fmt(loudest, 4)
+                + ", utterances " + std::to_string(utterances)
+                + ", speech " + Fmt(float(speechSeconds), 2) + "s"
+                + (utterances > 0 ? ", last rms " + Fmt(lastUtteranceRms, 4) : ""));
+
+            if (!status.opened)
+                return 1;
+            if (loudest <= 0.00001f)
+            {
+                Log("VRMPet: probe mic - the device delivered digital silence. On Windows 11 "
+                    "that is usually Settings > Privacy > Microphone rather than the A.");
+                return 1;
+            }
+            if (g_probeSeconds >= 3 && utterances == 0)
+            {
+                Log("VRMPet: probe mic - the device is live but nothing crossed the speech "
+                    "gate; say something, or lower VRMPet's start threshold.");
+                return 1;
+            }
+            Log("VRMPet: probe mic OK");
+            return 0;
+        }
+
+        // --- the bubble band, and nothing else ------------------------------
+        if (g_probeMode == "bubble")
+        {
+            CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+            Bubble bubble;
+            if (!bubble.Create(kBubbleBandWidth, kBubbleBandHeight))
+            {
+                Log("VRMPet: probe bubble FAILED - the band was not created");
+                return 1;
+            }
+
+            bubble.OnTranscript(1, "user",
+                g_probeArg.empty() ? "Hello, who are you?" : g_probeArg, true);
+            bubble.OnTranscript(2, "agent",
+                "Please, as if you didn't already know. I'm Draconia Malfoy, and I do not "
+                "repeat myself for people who cannot be bothered to listen.", true);
+            bubble.SetStatus("speaking");
+            bubble.SetLevel(0.6f, true);
+            bubble.Render();
+
+            const std::string path = outDir + "/bubble.bmp";
+            if (!bubble.SaveBitmap(path))
+            {
+                Log("VRMPet: probe bubble FAILED - could not write " + path);
+                return 1;
+            }
+
+            // A numeric orientation check, because "the text is upside down" is
+            // not something a log line can otherwise report: the bubbles sit in
+            // the upper part of the band and the status line at the bottom, so
+            // the top half must hold most of the opaque pixels.
+            size_t top = 0, bottom = 0;
+            for (int y = 0; y < bubble.Height(); ++y)
+            {
+                const uint8_t* row = bubble.Row(y);
+                for (int x = 0; x < bubble.Width(); ++x)
+                {
+                    if (row[size_t(x) * 4 + 3] > 8)
+                        (y < bubble.Height() / 2 ? top : bottom)++;
+                }
+            }
+            Log("VRMPet: probe bubble - wrote " + path + " ("
+                + std::to_string(bubble.Width()) + "x" + std::to_string(bubble.Height()) + ")");
+            Log("VRMPet: probe bubble - opaque pixels: top half " + std::to_string(top)
+                + ", bottom half " + std::to_string(bottom));
+            return (top > bottom) ? 0 : 1;
+        }
+
+        // --- the three network legs -----------------------------------------
+        FishClient fish;
+        if (!fish.Configure(EnvDirs()))
+        {
+            Log("VRMPet: probe " + g_probeMode + " FAILED - " + fish.Error());
+            return 2;
+        }
+        if (!fish.ResolveAgent() || !fish.FetchAgentConfig())
+        {
+            Log("VRMPet: probe " + g_probeMode + " FAILED - " + fish.Error());
+            return 2;
+        }
+
+        if (g_probeMode == "agent")
+        {
+            std::vector<TurnMessage> conversation;
+            conversation.push_back({ "user", g_probeArg.empty() ? "Hello, who are you?" : g_probeArg });
+            std::string reply;
+            FishResult result;
+            if (!fish.AgentTurn(conversation, reply, result))
+            {
+                Log("VRMPet: probe agent FAILED - " + result.error);
+                return 1;
+            }
+            Log("VRMPet: probe agent - reply in " + FmtMs(result.ms) + ": " + reply);
+            Log("VRMPet: probe agent OK (the scratch test is deleted; the run stays on "
+                "the account's run list)");
+            return 0;
+        }
+
+        if (g_probeMode == "tts")
+        {
+            std::vector<int16_t> samples;
+            FishResult result;
+            if (!fish.Tts(g_probeArg.empty() ? "Oh please, Potter. Try to keep up." : g_probeArg,
+                          samples, result))
+            {
+                Log("VRMPet: probe tts FAILED - " + result.error);
+                return 1;
+            }
+
+            const std::vector<uint8_t> wav = WrapPcm16AsWav(samples, 16000);
+            const size_t expected = 44 + samples.size() * 2;
+            const std::string path = outDir + "/tts.wav";
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (f != nullptr)
+            {
+                std::fwrite(wav.data(), 1, wav.size(), f);
+                std::fclose(f);
+            }
+
+            Log("VRMPet: probe tts - " + std::to_string(samples.size()) + " samples = "
+                + Fmt(float(samples.size()) / 16000.0f, 2) + "s at 16 kHz mono, in "
+                + FmtMs(result.ms));
+            Log("VRMPet: probe tts - wrapped " + std::to_string(wav.size()) + " bytes (expected "
+                + std::to_string(expected) + ") -> " + path);
+
+            std::string why;
+            const bool good = SafeToPlay(wav.data(), wav.size(), why);
+            Log("VRMPet:   validator accepts our own wav: " + std::string(good ? "yes" : "NO")
+                + (why.empty() ? "" : " (" + why + ")"));
+
+            // The negative test the design document asks for at stage 0: the
+            // placeholder data size a streaming endpoint writes must be rejected
+            // before it reaches wi::audio, where it would be a 4 GB resize.
+            std::vector<uint8_t> corrupted = wav;
+            const uint32_t placeholder = 0xFFFFFC00u;
+            memcpy(&corrupted[40], &placeholder, 4);
+            std::string whyCorrupt;
+            const bool rejected = !SafeToPlay(corrupted.data(), corrupted.size(), whyCorrupt);
+            Log("VRMPet:   validator rejects the streaming placeholder size: "
+                + std::string(rejected ? "yes" : "NO") + " (" + whyCorrupt + ")");
+
+            if (!good || !rejected || wav.size() != expected)
+            {
+                Log("VRMPet: probe tts FAILED");
+                return 1;
+            }
+            Log("VRMPet: probe tts OK");
+            return 0;
+        }
+
+        if (g_probeMode == "asr")
+        {
+            std::vector<uint8_t> bytes;
+            if (g_probeArg.empty() || !ReadFileBytes(g_probeArg, bytes))
+            {
+                Log("VRMPet: probe asr FAILED - could not read '" + g_probeArg + "'");
+                return 2;
+            }
+
+            std::string why;
+            if (!SafeToPlay(bytes.data(), bytes.size(), why))
+            {
+                Log("VRMPet: probe asr FAILED - " + why);
+                return 2;
+            }
+
+            // Walk our own header rather than trust anything in it twice.
+            size_t dataPos = 0, dataSize = 0;
+            uint32_t rate = 0;
+            size_t pos = 12;
+            while (pos + 8 <= bytes.size())
+            {
+                char id[4];
+                memcpy(id, bytes.data() + pos, 4);
+                uint32_t size = 0;
+                memcpy(&size, bytes.data() + pos + 4, 4);
+                if (memcmp(id, "fmt ", 4) == 0)
+                    memcpy(&rate, bytes.data() + pos + 8 + 4, 4);
+                if (memcmp(id, "data", 4) == 0)
+                {
+                    dataPos = pos + 8;
+                    dataSize = size;
+                    break;
+                }
+                pos += 8 + size + (size & 1u);
+            }
+
+            std::vector<int16_t> samples(dataSize / 2);
+            memcpy(samples.data(), bytes.data() + dataPos, dataSize);
+
+            std::string text;
+            FishResult result;
+            if (!fish.Asr(samples, int(rate == 0 ? 16000 : rate), text, result))
+            {
+                Log("VRMPet: probe asr FAILED - " + result.error);
+                return 1;
+            }
+            Log("VRMPet: probe asr - " + Fmt(float(samples.size()) / float(rate), 2)
+                + "s at " + std::to_string(rate) + " Hz -> \"" + text + "\" in "
+                + FmtMs(result.ms));
+            Log("VRMPet: probe asr OK");
+            return 0;
+        }
+
+        Log("VRMPet: probe '" + g_probeMode + "' is not a probe");
+        return 2;
+    }
 }
 
 class PetApp : public wi::Application
@@ -383,6 +773,18 @@ public:
     // margin. Starts at INT_MIN so the very first measurement always reports,
     // whether it is a warning or the reassuring "still contains it" line.
     int  overlayOverflow = INT_MIN;
+
+    // Voice and chat. The bubble band is composited into the overlay's own
+    // bitmap, so there is no second window and no separate log.
+    vrmpet::Bubble         bubble;
+    vrmpet::Speaker        speaker;
+    vrmpet::CallController call;
+    bool   voiceStarted = false;
+    int    bandW = 0, bandH = 0, avatarX = 0, avatarY = 0;
+    bool   askSent = false;
+    bool   bandNotYetComposited = true;
+    double askStartAt = -1.0;
+    double askDoneAt = -1.0;
 
     void Initialize() override
     {
@@ -477,7 +879,7 @@ public:
 
         if (g_overlayMode)
         {
-            UpdateOverlay();
+            UpdateOverlay(dt);
             return;
         }
 
@@ -582,7 +984,7 @@ private:
     // -----------------------------------------------------------------------
     // Overlay mode
     // -----------------------------------------------------------------------
-    void UpdateOverlay()
+    void UpdateOverlay(float dt)
     {
         if (!overlayReady)
         {
@@ -594,9 +996,148 @@ private:
             return;
         }
 
-        // Nothing to do here - the capture happens in OnFrameComplete(), after
-        // the frame has been rendered and presented. This only counts frames.
+        if (!voiceStarted)
+        {
+            StartVoice();
+            voiceStarted = true;
+        }
+
+        // The mouth is driven here, on the main thread, because every wi::audio
+        // call is made here. An idle speaker still gets an update: that is what
+        // closes the mouth. The capture itself happens in OnFrameComplete().
+        const float mouth = speaker.Update(dt, g_mouthGain);
+        vrmpet::ApplyMouth(mouth);
+
+        // Drain the worker's events into the bubble, then publish the state the
+        // band shows. Both are Direct2D on this thread's DC, so both are here.
+        call.Tick();
+        bubble.SetLevel(call.Level(), call.MicOpen());
+        bubble.SetStatus(call.StatusText());
+
+        if (!g_askText.empty() && !askSent)
+        {
+            Log("VRMPet: scripted turn - \"" + g_askText + "\"");
+            call.SendText(g_askText);
+            askSent = true;
+            askStartAt = vrmpet::NowSeconds();
+        }
+
+        // "ask" mode exists so a turn can be verified end to end without a
+        // microphone and without watching the screen: it quits once the reply
+        // has been spoken, so the run has a defined end and a measurable length.
+        if (askSent && g_overlaySecs <= 0)
+        {
+            const double now = vrmpet::NowSeconds();
+            const bool quiet = !call.Busy() && !speaker.IsPlaying() && speaker.Pending() == 0;
+            if (quiet && speaker.SpokenLines() > 0)
+            {
+                if (askDoneAt < 0.0)
+                {
+                    askDoneAt = now;
+                    Log("VRMPet: scripted turn spoken - quitting in 2s");
+                }
+                else if (now - askDoneAt > 2.0)
+                {
+                    wi::backlog::Flush();
+                    PostQuitMessage(0);
+                }
+            }
+            else if (askStartAt > 0.0 && now - askStartAt > 120.0)
+            {
+                Log("VRMPet: WARNING - the scripted turn never produced speech; quitting");
+                wi::backlog::Flush();
+                PostQuitMessage(0);
+            }
+        }
+
         ++overlaySettle;
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice wiring
+    //
+    // Everything the transport needs is built here and nowhere else, and the
+    // two directions are kept apart on purpose: the worker thread produces audio
+    // and events, this thread (through Speaker and Bubble) consumes them.
+    // -----------------------------------------------------------------------
+    void StartVoice()
+    {
+        const std::string exeDir = vrmpet::ExeDirectory();
+        const std::vector<std::string> envDirs = {
+            vrmpet::WorkingDirectory(),
+            exeDir,
+            vrmpet::JoinPath(exeDir, ".."),
+            vrmpet::JoinPath(exeDir, "../.."),
+            vrmpet::JoinPath(exeDir, "../../.."),
+        };
+
+        call.Configure(envDirs);
+
+        // The samples cross the thread boundary once per spoken sentence and are
+        // owned by the main thread from that point on.
+        call.SetAudioSink([this](std::vector<int16_t> samples)
+        {
+            speaker.Enqueue(std::move(samples), std::string());
+        });
+
+        vrmpet::AgentEvents events;
+        events.onTranscript = [this](uint32_t segmentId, const std::string& role,
+                                     const std::string& text, bool final)
+        {
+            bubble.OnTranscript(segmentId, role, text, final);
+        };
+        events.onMode = [](const std::string& mode) { Log("VRMPet: mode -> " + mode); };
+        events.onError = [](const std::string& message) { Log("VRMPet: turn failed - " + message); };
+        call.Attach(events);
+
+        // Section 10.1 of the report, done before any mouth code runs: a model
+        // without an `aa` preset has no mouth at all, and the engine's own
+        // talking path would index presets[] out of bounds.
+        vrmpet::DumpExpressionPresets();
+        std::string why;
+        if (!vrmpet::MouthAvailable(why))
+            Log("VRMPet: no mouth - " + why);
+
+        if (!g_micEnabled)
+            Log("VRMPet: microphone muted at startup (-mute)");
+
+        call.Start();
+        Log("VRMPet: voice ready - Ctrl+Shift+V pastes the clipboard as a message, "
+            "Ctrl+Shift+H widens the transcript, Ctrl+Shift+M mutes the mic");
+    }
+
+    // Ctrl+Shift+V / H / M. The overlay is click-through and has no taskbar
+    // button, so hotkeys are the only input surface it has - which is also why
+    // the clipped text comes from the clipboard rather than from a text box.
+    void OnOverlayHotkey(int id)
+    {
+        switch (id)
+        {
+        case 2:
+        {
+            const std::string text = ReadClipboardText();
+            if (text.empty())
+            {
+                Log("VRMPet: Ctrl+Shift+V - the clipboard holds no text");
+                break;
+            }
+            bubble.SetStatus("sending the clipboard...");
+            call.SendText(text);
+            break;
+        }
+        case 3:
+        {
+            const int next = bubble.HistoryLines() == 1 ? 3 : 1;
+            bubble.SetHistoryLines(next);
+            Log("VRMPet: transcript band -> " + std::to_string(next) + " lines");
+            break;
+        }
+        case 4:
+            call.SetMicEnabled(!call.MicEnabled());
+            break;
+        default:
+            break;
+        }
     }
 
     void OnFrameComplete()
@@ -720,32 +1261,74 @@ private:
             if (!ComputeCropBox(rgba.data(), w, h))
                 return;   // nothing rendered yet; try again next frame
 
+            // The bubble band is reserved here, once, before the window exists:
+            // the text grows inside it and the window never resizes.
+            bandW = kBubbleBandWidth;
+            bandH = kBubbleBandHeight;
+            const int canvasW = bandW + kOverlayGap + cropW;
+            const int canvasH = bandH + kOverlayGap + cropH;
+            avatarX = bandW + kOverlayGap;
+            avatarY = bandH + kOverlayGap;
+
             RECT wa = {};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
-            const int px = wa.right - cropW - g_overlayMargin;
-            const int py = wa.bottom - cropH - g_overlayMargin;
+            const int px = wa.right - canvasW - g_overlayMargin;
+            const int py = wa.bottom - canvasH - g_overlayMargin;
 
-            if (!g_overlay.Create(cropW, cropH, px, py))
+            if (!bubble.Create(bandW, bandH))
             {
-                wi::backlog::post("VRMPet: overlay window creation FAILED");
-                wi::backlog::Flush();
+                Log("VRMPet: bubble band creation FAILED - the avatar still runs, without text");
+            }
+
+            if (!g_overlay.Create(canvasW, canvasH, px, py))
+            {
+                Log("VRMPet: overlay window creation FAILED");
                 return;
             }
             g_overlay.Show();
 
-            wi::backlog::post("VRMPet: overlay window " + std::to_string(cropW) + "x"
-                + std::to_string(cropH) + " at " + std::to_string(px) + ","
-                + std::to_string(py) + "  (work area "
-                + std::to_string(wa.right - wa.left) + "x" + std::to_string(wa.bottom - wa.top)
-                + ", crop from " + std::to_string(cropX) + "," + std::to_string(cropY)
-                + ", " + std::to_string(kOverlayPad) + " px pad for the animation)");
+            g_overlayHotkey = [this](int id) { OnOverlayHotkey(id); };
+            if (!RegisterHotKey(g_overlay.hwnd, 2, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'V'))
+                Log("VRMPet: WARNING - could not register Ctrl+Shift+V (another app owns it)");
+            if (!RegisterHotKey(g_overlay.hwnd, 3, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'H'))
+                Log("VRMPet: WARNING - could not register Ctrl+Shift+H (another app owns it)");
+            if (!RegisterHotKey(g_overlay.hwnd, 4, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'M'))
+                Log("VRMPet: WARNING - could not register Ctrl+Shift+M (another app owns it)");
+
+            Log("VRMPet: overlay canvas " + std::to_string(canvasW) + "x" + std::to_string(canvasH)
+                + " at " + std::to_string(px) + "," + std::to_string(py)
+                + "  avatar " + std::to_string(cropW) + "x" + std::to_string(cropH)
+                + " at " + std::to_string(px + avatarX) + "," + std::to_string(py + avatarY)
+                + "  band " + std::to_string(bandW) + "x" + std::to_string(bandH)
+                + "  (work area " + std::to_string(wa.right - wa.left) + "x"
+                + std::to_string(wa.bottom - wa.top) + ", crop from "
+                + std::to_string(cropX) + "," + std::to_string(cropY) + ", "
+                + std::to_string(kOverlayPad) + " px pad for the animation)");
+            Log("VRMPet: avatar screen position is unchanged: "
+                + std::to_string(px + avatarX) + "," + std::to_string(py + avatarY));
             wi::backlog::Flush();
 
             overlayCreated = true;
             overlayClock = std::chrono::steady_clock::now();
         }
 
-        g_overlay.Blit(rgba.data(), w, cropX, cropY);
+        // Render the band, and copy it into the canvas only when it changed. The
+        // avatar blit below never touches these rows, which is what keeps the
+        // bubble at one composite per turn instead of one per frame.
+        if (bubble.Render() || bandNotYetComposited)
+        {
+            bandNotYetComposited = false;
+            for (int row = 0; row < bandH; ++row)
+            {
+                const uint8_t* src = bubble.Row(row);
+                if (src == nullptr)
+                    break;
+                memcpy(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4,
+                       src, size_t(bandW) * 4);
+            }
+        }
+
+        g_overlay.Blit(rgba.data(), w, cropX, cropY, cropW, cropH, avatarX, avatarY);
         g_overlay.Push();
 
         // The window is sized once and never resized, so re-measure occasionally
@@ -1398,6 +1981,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         if (argv != nullptr)
         {
             int base = 1;
+            bool skipPositional = false;
             // Overlay mode has its own argument layout, since it has no output
             // directory and no focus/isolate options.
             //   VRMPet.exe overlay [model.vrm] [azimuth] [msaa] [seconds] [anim.vrma]
@@ -1426,8 +2010,37 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                 // at you.
                 g_azimuthDeg = 180.0f;
             }
+            else if (argc > 1 && wcscmp(argv[1], L"ask") == 0)
+            {
+                // The overlay, plus one scripted turn with a defined end. This is
+                // how a whole turn is verified without a microphone and without
+                // watching the screen.
+                g_overlayMode  = true;
+                g_animPath     = "assets/idle_loop.vrma";
+                g_lookAtCamera = true;
+                g_azimuthDeg   = 180.0f;
+                g_askText      = (argc > 2) ? Narrow(argv[2]) : "";
+                skipPositional = true;
+            }
+            else if (argc > 1 && (wcscmp(argv[1], L"agent") == 0 ||
+                                  wcscmp(argv[1], L"tts")   == 0 ||
+                                  wcscmp(argv[1], L"asr")   == 0 ||
+                                  wcscmp(argv[1], L"bubble") == 0 ||
+                                  wcscmp(argv[1], L"mic")   == 0))
+            {
+                g_probeMode = Narrow(argv[1]);
+                if (g_probeMode == "mic")
+                    g_probeSeconds = (argc > 2) ? _wtoi(argv[2]) : 6;
+                else if (argc > 2)
+                    g_probeArg = Narrow(argv[2]);
+                skipPositional = true;
+            }
 
-            if (base == 2)
+            if (skipPositional)
+            {
+                // This mode has its own layout and no positional arguments to read.
+            }
+            else if (base == 2)
             {
                 if (argc > base + 0) g_modelPath   = Narrow(argv[base + 0]);
                 if (argc > base + 1) g_azimuthDeg  = float(_wtof(argv[base + 1]));
@@ -1456,10 +2069,24 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                     g_lookAtCamera = true;
                 else if (_wcsicmp(argv[i], L"nolookat") == 0)
                     g_lookAtCamera = false;
+                else if (_wcsicmp(argv[i], L"mute") == 0)
+                    g_micEnabled = false;
+                else if (_wcsnicmp(argv[i], L"gain=", 5) == 0)
+                    g_mouthGain = float(_wtof(argv[i] + 5));
             }
 
             LocalFree(argv);
         }
+    }
+
+    // Every probe runs here: before a window, before WickedEngine, before any
+    // shader is compiled. Nothing is presented and nothing is rendered, so the
+    // only thing that can have gone wrong is the leg under test.
+    if (!g_probeMode.empty())
+    {
+        const int code = RunProbe("out");
+        wi::backlog::Flush();
+        return code;
     }
 
     static auto WndProc = [](HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) -> LRESULT
@@ -1583,7 +2210,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     }
 
     if (g_overlayMode)
+    {
         UnregisterHotKey(hWnd, 1);
+        if (g_overlay.hwnd != nullptr)
+        {
+            UnregisterHotKey(g_overlay.hwnd, 2);
+            UnregisterHotKey(g_overlay.hwnd, 3);
+            UnregisterHotKey(g_overlay.hwnd, 4);
+        }
+        g_overlayHotkey = nullptr;
+    }
 
     wi::jobsystem::ShutDown();
     return (int)msg.wParam;

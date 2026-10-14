@@ -153,3 +153,10 @@ Thumbs.db
 desktop.ini
 .DS_Store
 .env
+.freebuff/project-id
+.probe_agents.json
+.probe_cfg.json
+.probe_llm.json
+.probe_asr.json
+.probe_live_openapi.json
+.probe_tts.bin

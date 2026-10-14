@@ -48,6 +48,20 @@ add_subdirectory("${WICKED_ENGINE_DIR}" "${CMAKE_BINARY_DIR}/wickedengine")
 # Editor/stdafx.h, which would drag in Editor.h and the entire editor.
 add_executable(VRMPet WIN32
     src/main.cpp
+    # Voice and chat (option A: everything in C++, no WebRTC).
+    #   util    string/path/.env helpers and the one logger
+    #   http    WinHTTP, because WickedEngine has no HTTP client
+    #   voice   WASAPI capture, the WAV header, and the validator that keeps a
+    #           network WAV away from wiAudio's unbounded chunk walker
+    #   fish    /v1/asr, the agent's own LLM, /v1/tts
+    #   bubble  the transcript band, Direct2D into the overlay's bitmap
+    #   petcall the turn: mic -> text -> reply -> speech -> mouth
+    src/util.cpp
+    src/http.cpp
+    src/voice.cpp
+    src/fish.cpp
+    src/bubble.cpp
+    src/petcall.cpp
     third_party/wicked_importer/ModelImporter_GLTF.cpp
 )
 
@@ -56,7 +70,21 @@ target_include_directories(VRMPet PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wicked_importer"  # our stdafx.h
 )
 
-target_link_libraries(VRMPet PRIVATE WickedEngine)
+# winhttp  - the transport (no HTTP client exists anywhere in the engine)
+# d2d1 +
+# dwrite   - the speech bubble; GDI text writes no usable alpha on a layered window
+# ole32 +
+# oleaut32 - WASAPI (the microphone) and the DirectWrite factory's COM plumbing
+# uuid     - IID_PPV_ARGS for the audio interfaces
+target_link_libraries(VRMPet PRIVATE
+    WickedEngine
+    winhttp
+    d2d1
+    dwrite
+    ole32
+    oleaut32
+    uuid
+)
 
 # tiny_gltf + nlohmann::json in a single TU overflow the default section limit.
 if(MSVC)
