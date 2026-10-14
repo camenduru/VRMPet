@@ -45,6 +45,7 @@ namespace vrmpet
 
         const std::string& Path() const { return path_; }
         std::vector<std::string> Unknown() const;   // in the file, not in this build
+        std::vector<std::string> Missing() const;   // in this build, not in the file
 
         // The full default file - every key, its value, and its comment.
         std::string Render() const;

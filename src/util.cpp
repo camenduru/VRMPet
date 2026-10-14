@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <chrono>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 
 namespace vrmpet
@@ -107,25 +108,43 @@ namespace vrmpet
         if (!file.is_open())
             return false;
 
+        const std::string content((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+
+        // Lines end at CR, LF or CRLF. Splitting only on LF - what std::getline
+        // does - turns a file with bare-CR line endings into a single line,
+        // and a single line that begins with '#' then parses to no keys at all:
+        // every setting silently falls back to its default, which is what the
+        // "0 keys set" line in the log was reporting. Writing the file with a
+        // tool that dropped its LFs is therefore a whole config, gone.
         std::string line;
-        while (std::getline(file, line))
+        for (size_t i = 0; i <= content.size(); ++i)
         {
-            line = Trim(line);
-            if (line.empty() || line[0] == '#')
-                continue;
-            const size_t eq = line.find('=');
-            if (eq == std::string::npos)
-                continue;
-            std::string key = Trim(line.substr(0, eq));
-            std::string value = Trim(line.substr(eq + 1));
-            if (value.size() >= 2 &&
-                ((value.front() == '"' && value.back() == '"') ||
-                 (value.front() == '\'' && value.back() == '\'')))
+            const char c = (i < content.size()) ? content[i] : '\n';
+            if (c != '\r' && c != '\n')
             {
-                value = value.substr(1, value.size() - 2);
+                line += c;
+                continue;
             }
-            if (!key.empty())
-                out.emplace_back(key, value);
+            line = Trim(line);
+            if (!line.empty() && line[0] != '#')
+            {
+                const size_t eq = line.find('=');
+                if (eq != std::string::npos)
+                {
+                    std::string key = Trim(line.substr(0, eq));
+                    std::string value = Trim(line.substr(eq + 1));
+                    if (value.size() >= 2 &&
+                        ((value.front() == '"' && value.back() == '"') ||
+                         (value.front() == '\'' && value.back() == '\'')))
+                    {
+                        value = value.substr(1, value.size() - 2);
+                    }
+                    if (!key.empty())
+                        out.emplace_back(key, value);
+                }
+            }
+            line.clear();
         }
         return true;
     }

@@ -1,0 +1,147 @@
+# VRMPet - everything this tool can be told, in one file.
+#
+# Read at startup from config.txt beside VRMPet.exe (or, failing that, the
+# working directory). A key that is not in this file keeps the value shown
+# below; a key that is here overrides it, on the next run.
+#
+# Syntax: one `key = value` per line. A value runs to the end of its line and is
+# taken as written - '#' is a comment only at the start of a line, never inside
+# a value, because a colour is written #RRGGBB. Comments go on their own line.
+#
+# FISH_API_KEY is a secret. The copy beside VRMPet.exe lives in build/, which
+# is gitignored; this copy is shipped with the code, so leave the key out of it.
+#
+# This file is regenerated from the build with:  VRMPet.exe config
+
+# --- fish ---
+# your Fish Audio key - the only secret in this file
+FISH_API_KEY =
+
+# where that key is sent; leave it alone unless you are testing a stub
+FISH_API_BASE = https://api.fish.audio
+
+# the agent's name on fish.audio, exactly as it appears there
+AGENT = 
+
+# TTS voice model; the valid names are read from the API at startup
+MODEL = drama-3
+
+# what the pet says when it appears; empty means it waits to be spoken to. \n is a line break
+GREET = 
+
+# --- avatar ---
+# how big the pet is on screen: 1.0 as framed, 2.0 twice as tall. 0.25..4
+avatar.zoom = 1.0
+
+# --- overlay ---
+# gap in px between the pet and the edge of the work area
+overlay.margin = 0
+
+# engine render target, px; the avatar is captured from this and cropped
+overlay.window_size = 1024
+
+# headroom in px around the avatar, so an idle sway is never clipped
+overlay.crop_pad = 40
+
+# frames between re-measurements of the crop box
+overlay.check_frames = 60
+
+# frames rendered before the first capture, so spring bones have settled
+overlay.settle_frames = 30
+
+# quit after this many seconds; 0 runs until Ctrl+Shift+Q
+overlay.seconds = 0
+
+# 1: the pet can be dragged and right-clicked on its own pixels; 0: always click-through
+overlay.grabbable = 1
+
+# how solid a pixel must be (0-255) to count as the pet; raise it if the edge feels sticky
+overlay.grab_alpha = 24
+
+# --- voice ---
+# scales the reply's audio level into the mouth; some voices need more
+mouth.gain = 1.0
+
+# --- band ---
+# 1: the transcript band is shown; 0: the pet runs with no bubbles (right-click toggles it)
+band.visible = 1
+
+# px; the band sits directly above the avatar's head
+band.width = 420
+
+# px; four one-line bubbles plus the status line
+band.height = 214
+
+# px between the bottom of the band and the top of the avatar
+band.gap = 10
+
+# bubbles shown at once, 1..band.turns_shown (Ctrl+Shift+H toggles)
+band.history_lines = 3
+
+# most bubbles the band can lay out before it overflows
+band.turns_shown = 4
+
+# turns kept in memory, so a long conversation does not grow forever
+band.max_segments = 12
+
+# --- band style ---
+band.font_family = Segoe UI
+
+# bubble text, px
+band.font_size = 14
+
+# the status line and mic meter, px
+band.status_font_size = 11
+
+# one line of text at band.font_size, px
+band.line_height = 19
+
+# horizontal padding inside a bubble, px
+band.pad_x = 12
+
+# vertical padding inside a bubble, px
+band.pad_y = 8
+
+# bubble corner radius, px
+band.radius = 10
+
+# px between two bubbles
+band.line_gap = 8
+
+# right margin a bubble leaves for the tail, px
+band.tail_room = 26
+
+# rows in the tail at full width, px
+band.tail_rows = 14
+
+# width of the tail where it meets the bubble, px
+band.tail_base = 26
+
+# reserved at the bottom of the band for status + meter, px
+band.status_height = 26
+
+# --- band colors ---
+# a reply
+band.agent_color = #FCFCFFF2
+
+# what you said
+band.user_color = #FFF2D4F0
+
+# reserved for tool output
+band.tool_color = #E0E0EBE6
+
+band.text_color = #0F121AFF
+
+# the hairline around a bubble
+band.border_color = #3338478C
+
+band.status_color = #1A1F29BF
+
+# the mic meter's background
+band.mic_track_color = #4D526159
+
+# the meter while the mic is open
+band.mic_live_color = #3DB85CF2
+
+# the meter while the mic is muted
+band.mic_muted_color = #BF423DF2

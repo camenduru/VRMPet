@@ -64,12 +64,14 @@
 //    VRMPet.exe tts "hello"        one line of speech as wav + validation
 //    VRMPet.exe mic 10             the microphone and the speech gate, no network
 //    VRMPet.exe bubble "hello"     the bubble band alone, written to a BMP
+//    VRMPet.exe config             the complete config.txt, to stdout
 //    VRMPet.exe ask "hello"        overlay + one scripted turn, then quit
 // ---------------------------------------------------------------------------
 
 #include "WickedEngine.h"
 
 #include <shellapi.h>
+#include <windowsx.h>   // GET_X_LPARAM, for the hit test
 
 #include "bubble.h"
 #include "config.h"
@@ -108,13 +110,14 @@ namespace
     // -----------------------------------------------------------------------
     std::vector<std::string> ConfigSearchPath()
     {
-        const std::string exeDir = vrmpet::ExeDirectory();
-        return {
-            exeDir,                              // build/run/config.txt
-            vrmpet::WorkingDirectory(),
-            vrmpet::JoinPath(exeDir, ".."),      // build/config.txt
-            vrmpet::JoinPath(exeDir, "../.."),   // <project>/config.txt
-        };
+        // The shipped config.txt is staged beside the executable by the build
+        // (see CMakeLists.txt), and the working directory is checked second so
+        // the tool also works when it is launched with a file manager's default
+        // directory. The project root deliberately is NOT searched: the file in
+        // the repository is the template the build copies from, and a second
+        // copy that silently disagreed with the live one would be worse than no
+        // fallback at all.
+        return { vrmpet::ExeDirectory(), vrmpet::WorkingDirectory() };
     }
 
     int   WindowSize()  { return vrmpet::Settings().Int("overlay.window_size"); }
@@ -168,6 +171,7 @@ namespace
     // here and a std::wstring there; both bind to an LPWSTR argument.
     using vrmpet::Fmt;
     using vrmpet::Log;
+    using vrmpet::Settings;
     std::string Narrow(const wchar_t* wide) { return vrmpet::Narrow(wide == nullptr ? std::wstring() : std::wstring(wide)); }
 
     std::string JoinPath(std::string dir, const std::string& rel)
@@ -290,12 +294,17 @@ namespace
     // the only place that knows a network exists.
     std::string g_askText;                  // "ask" mode: one scripted turn, then quit
     bool        g_askMode = false;          // ...and only that one turn: no greeting
-    std::string g_probeMode;                // agent | asr | tts | mic | bubble
+    std::string g_probeMode;                // agent | asr | tts | mic | bubble | config
     std::string g_probeArg;
     int         g_probeSeconds = 6;
     float       g_mouthGain = 1.0f;
     bool        g_mouthGainFromCli = false;
     bool        g_micEnabled = true;
+
+    // Whether the transcript band is drawn. Set from band.visible at startup and
+    // flipped by the right-click menu from then on; the window keeps its full
+    // size either way, so the band is blanked rather than the layout moving.
+    bool        g_bandVisible = true;
 
     // Frames to render before the first blit, so spring bones and temporal
     // effects have settled and the character is not captured mid-twitch.
@@ -314,6 +323,13 @@ namespace
     // declared after it.
     std::function<void(int)> g_overlayHotkey;
 
+    // A pointer to the overlay, declared before the overlay itself: an object
+    // cannot be declared before its own type, but a pointer to it can, and the
+    // inline window proc below needs to name it. Set at the top of Create(),
+    // before the window exists - messages can arrive during creation.
+    struct LayeredOverlay;
+    LayeredOverlay* g_overlayPtr = nullptr;
+
     struct LayeredOverlay
     {
         HWND     hwnd = nullptr;
@@ -327,6 +343,7 @@ namespace
 
         bool Create(int width, int height, int posX, int posY)
         {
+            g_overlayPtr = this;
             w = width;
             h = height;
             x = posX;
@@ -342,9 +359,15 @@ namespace
             wc.lpszClassName = L"VRMPetOverlay";
             RegisterClassExW(&wc);
 
+            // WS_EX_TRANSPARENT is deliberately NOT set. It would make the whole
+            // window click-through, which also means the pet could never be
+            // grabbed or right-clicked. The click-through is per pixel instead,
+            // in WM_NCHITTEST below: the avatar's own pixels belong to the pet,
+            // everything else on the canvas still belongs to the desktop behind
+            // it. overlay.grabbable = 0 restores the old always-click-through
+            // window for anyone who wants the pet to be pure decoration.
             hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
-                WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 wc.lpszClassName, L"VRMPet",
                 WS_POPUP,
                 x, y, w, h,
@@ -425,12 +448,171 @@ namespace
             UpdateLayeredWindow(hwnd, nullptr, &dstPt, &size, dc, &srcPt, 0, &bf, ULW_ALPHA);
         }
 
+        // Is this canvas pixel solid enough to be the pet? The composited
+        // bitmap is the only thing that knows: its alpha is the avatar's
+        // silhouette blended with whatever the band drew, so a test on it is a
+        // test on exactly what the user can see. (This is the same channel
+        // ComputeCropBox() measures, read for a different reason.)
+        bool OpaqueAt(int clientX, int clientY) const
+        {
+            if (bits == nullptr || clientX < 0 || clientY < 0 || clientX >= w || clientY >= h)
+                return false;
+            const int threshold = (std::max)(0, (std::min)(255, Settings().Int("overlay.grab_alpha")));
+            return bits[(size_t(clientY) * size_t(w) + size_t(clientX)) * 4 + 3] >= uint8_t(threshold);
+        }
+
+        // The right-click menu: the only way to close the pet with a mouse. The
+        // overlay has no taskbar button, no title bar and never takes focus, so
+        // without this Ctrl+Shift+Q would be the only way out - which is fine
+        // for its author and useless for everyone else.
+        static void ShowMenu(HWND hWnd)
+        {
+            HMENU menu = CreatePopupMenu();
+            if (menu == nullptr)
+                return;
+
+            AppendMenuW(menu, MF_STRING, 1, L"Close VRMPet");
+            AppendMenuW(menu, MF_STRING, 2, L"Mute / unmute the microphone");
+            AppendMenuW(menu, MF_STRING, 3, L"Send the clipboard as a message");
+            AppendMenuW(menu, MF_STRING | (g_bandVisible ? MF_CHECKED : MF_UNCHECKED),
+                        7, L"Show transcript bubbles");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, 6, L"Open config.txt");
+            // Which copy, spelled out: there is a shipped template in the source
+            // tree and a live one beside the exe, and editing the wrong one is
+            // the one mistake this menu exists to prevent.
+            const std::string live = Settings().Path().empty()
+                ? JoinPath(vrmpet::ExeDirectory(), "config.txt") : Settings().Path();
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, vrmpet::Widen(live).c_str());
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, 4, L"Return to the corner");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 5, L"Drag the pet to move it");
+
+            POINT pt = {};
+            GetCursorPos(&pt);
+            // The window never activates, so it has to be pushed to the
+            // foreground for the menu to receive the click that dismisses it -
+            // and the WM_NULL afterwards is the documented way to close that
+            // door again rather than leave the window stuck in the foreground.
+            SetForegroundWindow(hWnd);
+            const int id = int(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                                pt.x, pt.y, hWnd, nullptr));
+            PostMessageW(hWnd, WM_NULL, 0, 0);
+            DestroyMenu(menu);
+
+            switch (id)
+            {
+            case 1:
+                wi::backlog::post("VRMPet: closed from the menu");
+                wi::backlog::Flush();
+                PostQuitMessage(0);
+                break;
+            case 2:
+                if (g_overlayHotkey) g_overlayHotkey(4);   // the mic hotkey's id
+                break;
+            case 3:
+                if (g_overlayHotkey) g_overlayHotkey(2);   // the clipboard hotkey's id
+                break;
+            case 4:
+                MoveHome(hWnd);
+                break;
+            case 6:
+                OpenConfig(hWnd);
+                break;
+            case 7:
+                if (g_overlayHotkey) g_overlayHotkey(7);   // the bubbles' toggle
+                break;
+            default:
+                break;
+            }
+        }
+
+        // Back to the work area's corner, which is where Create() put it. The
+        // window's own rect is all that has to move: the band and the avatar are
+        // two halves of one bitmap, so they cannot come apart.
+        static void OpenConfig(HWND hWnd)
+        {
+            std::string path = Settings().Path();
+            if (path.empty())
+            {
+                path = JoinPath(vrmpet::ExeDirectory(), "config.txt");
+                // No file anywhere yet: write one so "open" opens a real file
+                // rather than the shell's "where is it" dialog.
+                Settings().Load(ConfigSearchPath());
+                path = Settings().Path().empty() ? path : Settings().Path();
+            }
+
+            const HINSTANCE result = ShellExecuteW(hWnd, L"open",
+                                                   vrmpet::Widen(path).c_str(),
+                                                   nullptr, nullptr, SW_SHOWNORMAL);
+            if (INT_PTR(result) <= 32)
+            {
+                wi::backlog::post("VRMPet: could not open " + path + " (ShellExecute returned "
+                                  + std::to_string((long long)result) + ") - open it by hand");
+                wi::backlog::Flush();
+            }
+            else
+            {
+                wi::backlog::post("VRMPet: opened " + path);
+                wi::backlog::Flush();
+            }
+        }
+
+        static void MoveHome(HWND hWnd)
+        {
+            if (g_overlayPtr == nullptr)
+                return;
+            LayeredOverlay& self = *g_overlayPtr;
+            RECT wa = {};
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+            const int homeX = wa.right - self.w - Settings().Int("overlay.margin");
+            const int homeY = wa.bottom - self.h - Settings().Int("overlay.margin");
+            self.x = homeX;
+            self.y = homeY;
+            SetWindowPos(hWnd, HWND_TOPMOST, homeX, homeY, self.w, self.h,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            wi::backlog::post("VRMPet: overlay moved back to " + std::to_string(homeX) + ","
+                              + std::to_string(homeY));
+            wi::backlog::Flush();
+        }
+
         static LRESULT CALLBACK OverlayProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         {
             switch (msg)
             {
             case WM_NCHITTEST:
-                return HTTRANSPARENT;   // belt and braces alongside WS_EX_TRANSPARENT
+            {
+                // Per-pixel click-through, and the drag: returning HTCAPTION
+                // hands the move to Windows' own modal drag loop, which is the
+                // only way to move a layered window without a frame of lag
+                // behind the cursor.
+                if (!Settings().Flag("overlay.grabbable"))
+                    return HTTRANSPARENT;
+                POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ScreenToClient(hWnd, &pt);
+                return g_overlayPtr != nullptr && g_overlayPtr->OpaqueAt(pt.x, pt.y)
+                    ? HTCAPTION : HTTRANSPARENT;
+            }
+            case WM_NCLBUTTONDBLCLK:
+                return 0;   // a double-click on the pet must not maximise it
+            case WM_MOVE:
+            {
+                // The window was dragged. Push() passes a destination point to
+                // UpdateLayeredWindow every frame, so a stale x/y would snap the
+                // pet back to where it started on the next composite.
+                POINT origin = { 0, 0 };
+                ClientToScreen(hWnd, &origin);
+                if (g_overlayPtr != nullptr)
+                {
+                    g_overlayPtr->x = origin.x;
+                    g_overlayPtr->y = origin.y;
+                }
+                return 0;
+            }
+            case WM_RBUTTONUP:
+            case WM_NCRBUTTONUP:
+                ShowMenu(hWnd);
+                return 0;
             case WM_HOTKEY:
                 if (wParam == 1)
                 {
@@ -479,17 +661,7 @@ namespace
         return text;
     }
 
-    std::vector<std::string> EnvDirs()
-    {
-        const std::string exeDir = vrmpet::ExeDirectory();
-        return {
-            vrmpet::WorkingDirectory(),
-            exeDir,
-            JoinPath(exeDir, ".."),
-            JoinPath(exeDir, "../.."),
-            JoinPath(exeDir, "../../.."),
-        };
-    }
+    // config.txt lookup is ConfigSearchPath() above; this name is gone with .env.
 
     bool ReadFileBytes(const std::string& path, std::vector<uint8_t>& out)
     {
@@ -650,9 +822,23 @@ namespace
             return (top > bottom) ? 0 : 1;
         }
 
+        // The complete file, to stdout, so it can be redirected into a fresh
+        // install (or the project's shipped copy) rather than documented. It
+        // comes from the same table the reader falls back to, so what is printed
+        // is exactly what an absent key would take.
+        if (g_probeMode == "config")
+        {
+            const std::string text = vrmpet::Settings().Render();
+            std::fwrite(text.data(), 1, text.size(), stdout);
+            std::fflush(stdout);
+            Log("VRMPet: probe config - " + std::to_string(text.size()) + " bytes to stdout ("
+                + std::to_string(vrmpet::Settings().Missing().size()) + " keys not set in the live file)");
+            return 0;
+        }
+
         // --- the three network legs -----------------------------------------
         FishClient fish;
-        if (!fish.Configure(EnvDirs()))
+        if (!fish.Configure(ConfigSearchPath()))
         {
             Log("VRMPet: probe " + g_probeMode + " FAILED - " + fish.Error());
             return 2;
@@ -1189,6 +1375,14 @@ private:
         case 4:
             call.SetMicEnabled(!call.MicEnabled());
             break;
+        case 7:
+            // Blank or restore the band. bandNotYetComposited makes the next
+            // frame act on the change instead of waiting for the bubble to
+            // become dirty, which for "hide" would never happen.
+            g_bandVisible = !g_bandVisible;
+            bandNotYetComposited = true;
+            Log("VRMPet: transcript band " + std::string(g_bandVisible ? "shown" : "hidden"));
+            break;
         default:
             break;
         }
@@ -1388,17 +1582,33 @@ private:
         // Render the band, and copy it into the canvas only when it changed. The
         // avatar blit below never touches these rows, which is what keeps the
         // bubble at one composite per turn instead of one per frame.
-        if (bubble.Render() || bandNotYetComposited)
+        if (g_bandVisible)
         {
+            if (bubble.Render() || bandNotYetComposited)
+            {
+                bandNotYetComposited = false;
+                for (int row = 0; row < bandH; ++row)
+                {
+                    const uint8_t* src = bubble.Row(row);
+                    if (src == nullptr)
+                        break;
+                    memcpy(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4 + size_t(bandX) * 4,
+                           src, size_t(bandW) * 4);
+                }
+            }
+        }
+        else if (bandNotYetComposited)
+        {
+            // Hidden, and this is the frame the toggle arrived on: wipe the band
+            // rows to fully transparent once. The avatar blit never writes these
+            // rows, so they stay blank until the band is shown again - which
+            // reuses the same one-shot flag. bubble.Render() is skipped while
+            // hidden, so a repaint that arrives in the meantime is not wasted;
+            // showing again repaints the latest text in one frame.
             bandNotYetComposited = false;
             for (int row = 0; row < bandH; ++row)
-            {
-                const uint8_t* src = bubble.Row(row);
-                if (src == nullptr)
-                    break;
-                memcpy(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4 + size_t(bandX) * 4,
-                       src, size_t(bandW) * 4);
-            }
+                memset(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4 + size_t(bandX) * 4,
+                       0, size_t(bandW) * 4);
         }
 
         g_overlay.Blit(rgba.data(), w, cropX, cropY, cropW, cropH, avatarX, avatarY);
@@ -1940,7 +2150,22 @@ private:
         const float fov = cam.fov;
 
         const float rad  = g_azimuthDeg * XM_PI / 180.0f;
-        const float dist = (radius / tanf(fov * 0.5f)) * 1.15f;
+
+        // How big the pet is, in one number. The framing distance is the only
+        // thing that decides the avatar's on-screen size, so zooming is moving
+        // the camera rather than scaling pixels: the render stays sharp at the
+        // configured window_size, and the crop box, the window, the band above
+        // the head and the mouth's pixel columns all follow without being told.
+        // Clamped, because 8.0 would put the camera inside the character and
+        // leave the crop box nothing to measure.
+        const float zoom = (std::max)(0.25f, (std::min)(4.0f, Settings().Float("avatar.zoom")));
+        const float dist = ((radius / tanf(fov * 0.5f)) * 1.15f) / zoom;
+        if (std::fabs(zoom - 1.0f) > 0.001f)
+        {
+            wi::backlog::post("VRMPet: avatar.zoom " + Fmt(zoom, 2) + " - framing distance "
+                              + Fmt(dist, 2) + " (was "
+                              + Fmt((radius / tanf(fov * 0.5f)) * 1.15f, 2) + ")");
+        }
 
         const XMFLOAT3 eye = XMFLOAT3(
             center.x + sinf(rad) * dist,
@@ -2117,6 +2342,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                      wcscmp(argv[1], L"tts")   == 0 ||
                      wcscmp(argv[1], L"asr")   == 0 ||
                      wcscmp(argv[1], L"bubble") == 0 ||
+                     wcscmp(argv[1], L"config") == 0 ||
                      wcscmp(argv[1], L"mic")   == 0)
             {
                 g_probeMode = Narrow(argv[1]);
@@ -2193,6 +2419,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     if (!g_overlaySecsFromCli)
         g_overlaySecs = vrmpet::Settings().Int("overlay.seconds");
     g_overlayMargin = vrmpet::Settings().Int("overlay.margin");
+    g_bandVisible = vrmpet::Settings().Flag("band.visible");
 
     // Every probe runs here: before a window, before WickedEngine, before any
     // shader is compiled. Nothing is presented and nothing is rendered, so the

@@ -1,6 +1,7 @@
 #include "config.h"
 #include "util.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -36,6 +37,9 @@ namespace vrmpet
             { "fish", "MODEL",        "drama-3", "TTS voice model; the valid names are read from the API at startup" },
             { "fish", "GREET",        "",    "what the pet says when it appears; empty means it waits to be spoken to. \\n is a line break" },
 
+            // --- how big the pet is -----------------------------------------
+            { "avatar", "avatar.zoom", "1.0", "how big the pet is on screen: 1.0 as framed, 2.0 twice as tall. 0.25..4" },
+
             // --- the pet on the desktop --------------------------------------
             { "overlay", "overlay.margin",        "0",    "gap in px between the pet and the edge of the work area" },
             { "overlay", "overlay.window_size",   "1024", "engine render target, px; the avatar is captured from this and cropped" },
@@ -43,11 +47,14 @@ namespace vrmpet
             { "overlay", "overlay.check_frames",  "60",   "frames between re-measurements of the crop box" },
             { "overlay", "overlay.settle_frames", "30",   "frames rendered before the first capture, so spring bones have settled" },
             { "overlay", "overlay.seconds",       "0",    "quit after this many seconds; 0 runs until Ctrl+Shift+Q" },
+            { "overlay", "overlay.grabbable",     "1",    "1: the pet can be dragged and right-clicked on its own pixels; 0: always click-through" },
+            { "overlay", "overlay.grab_alpha",    "24",   "how solid a pixel must be (0-255) to count as the pet; raise it if the edge feels sticky" },
 
             // --- the voice ---------------------------------------------------
             { "voice", "mouth.gain", "1.0", "scales the reply's audio level into the mouth; some voices need more" },
 
             // --- the transcript band, the box the window reserves ------------
+            { "band", "band.visible",        "1",   "1: the transcript band is shown; 0: the pet runs with no bubbles (right-click toggles it)" },
             { "band", "band.width",          "420", "px; the band sits directly above the avatar's head" },
             { "band", "band.height",         "214", "px; four one-line bubbles plus the status line" },
             { "band", "band.gap",            "10",  "px between the bottom of the band and the top of the avatar" },
@@ -145,6 +152,25 @@ namespace vrmpet
         if (!unknown.empty())
             Log("VRMPet: config - ignoring unrecognised key(s): " + unknown);
         Log("VRMPet: config " + path_ + " (" + std::to_string(items_.size()) + " keys set)");
+
+        // A file that has fallen behind the build is not an error - every key
+        // not in it keeps its default - but it is worth one line, because the
+        // whole point of shipping config.txt is that the knobs are visible, and
+        // a knob that is absent from the file is invisible.
+        const std::vector<std::string> missing = Missing();
+        if (!missing.empty())
+        {
+            std::string names;
+            for (const std::string& key : missing)
+            {
+                if (!names.empty())
+                    names += ", ";
+                names += key;
+            }
+            Log("VRMPet: config - " + std::to_string(missing.size()) + " key(s) this build knows "
+                "are not in the file (using defaults): " + names);
+            Log("VRMPet: config - `VRMPet.exe config` prints the complete file to stdout");
+        }
     }
 
     std::string Config::Default(const std::string& key)
@@ -212,22 +238,36 @@ namespace vrmpet
         return out;
     }
 
+    std::vector<std::string> Config::Missing() const
+    {
+        std::vector<std::string> out;
+        for (const Entry& entry : kEntries)
+        {
+            const bool present = std::any_of(items_.begin(), items_.end(),
+                [&](const std::pair<std::string, std::string>& item) { return item.first == entry.key; });
+            if (!present)
+                out.push_back(entry.key);
+        }
+        return out;
+    }
+
     std::string Config::Render() const
     {
         std::string out;
         out += "# VRMPet - everything this tool can be told, in one file.\n";
         out += "#\n";
         out += "# Read at startup from config.txt beside VRMPet.exe (or, failing that, the\n";
-        out += "# working directory or the folders above it), on the same folder-first rule\n";
-        out += "# CMake uses to stage assets/. A key that is not in this file keeps the value\n";
-        out += "# shown below; a key that is here overrides it, on the next run.\n";
+        out += "# working directory). A key that is not in this file keeps the value shown\n";
+        out += "# below; a key that is here overrides it, on the next run.\n";
         out += "#\n";
         out += "# Syntax: one `key = value` per line. A value runs to the end of its line and is\n";
         out += "# taken as written - '#' is a comment only at the start of a line, never inside\n";
         out += "# a value, because a colour is written #RRGGBB. Comments go on their own line.\n";
         out += "#\n";
-        out += "# This file holds the API key, so it is gitignored. Do not paste it anywhere.\n";
-        out += "# Delete it and the next run writes it again.\n";
+        out += "# FISH_API_KEY is a secret. The copy beside VRMPet.exe lives in build/, which\n";
+        out += "# is gitignored; this copy is shipped with the code, so leave the key out of it.\n";
+        out += "#\n";
+        out += "# This file is regenerated from the build with:  VRMPet.exe config\n";
 
         const char* section = nullptr;
         for (const Entry& entry : kEntries)

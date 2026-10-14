@@ -78,6 +78,8 @@ target_include_directories(VRMPet PRIVATE
 # ole32 +
 # oleaut32 - WASAPI (the microphone) and the DirectWrite factory's COM plumbing
 # uuid     - IID_PPV_ARGS for the audio interfaces
+# shell32  - "Open config.txt" from the right-click menu (ShellExecuteW);
+#            CommandLineToArgvW for the command line comes from here too
 target_link_libraries(VRMPet PRIVATE
     WickedEngine
     winhttp
@@ -86,6 +88,7 @@ target_link_libraries(VRMPet PRIVATE
     ole32
     oleaut32
     uuid
+    shell32
 )
 
 # tiny_gltf + nlohmann::json in a single TU overflow the default section limit.
@@ -118,6 +121,20 @@ add_custom_command(TARGET VRMPet POST_BUILD
             "${CMAKE_CURRENT_SOURCE_DIR}/assets"
             "${VRMPET_RUNDIR}/assets"
     COMMENT "Staging assets/ next to VRMPet.exe"
+)
+
+# config.txt ships with the exe and lands beside it, which is where the tool
+# reads it from. The copy is made only when there is not one there already:
+# the shipped file is a template with an empty API key, and overwriting the live
+# copy would throw away the key (and the tuning) every build. A build is then
+# idempotent, and a fresh build dir gets a file the tool would have written
+# itself anyway - this way it is written by the build, with the comments.
+add_custom_command(TARGET VRMPet POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/config.txt
+            -DDEST=${VRMPET_RUNDIR}/config.txt
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/stage_config.cmake
+    COMMENT "Staging config.txt next to VRMPet.exe (never overwriting an existing one)"
 )
 
 # Content/ is 489 MB and only holds sample assets the prototype does not need.

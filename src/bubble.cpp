@@ -40,7 +40,12 @@ namespace vrmpet
             {
                 return float(std::strtol(s.substr(index, 2).c_str(), nullptr, 16)) / 255.0f;
             };
-            return ColorF(byte(0), byte(1), byte(2), s.size() == 8 ? byte(3) : 1.0f);
+            // Positions, not ordinals: #RRGGBBAA is bytes at 0, 2, 4, 6. Stepping
+            // by one overlaps them ("FCFCFFF2" would read FC, CF, FC, CF) and
+            // stepping to 3 for the alpha reads the middle of the string - both
+            // of which are what the first version of this did, and both of which
+            // render a plausible-looking but wrong-coloured bubble.
+            return ColorF(byte(0), byte(2), byte(4), s.size() == 8 ? byte(6) : 1.0f);
         }
 
         D2D1_COLOR_F FillFor(const Bubble::Style& style, const std::string& role)
@@ -50,6 +55,16 @@ namespace vrmpet
             if (role == "tool")
                 return style.toolColor;
             return style.agentColor;   // agent, and anything a future role adds
+        }
+
+        // The colour, back as the file wrote it - so a log line can show what
+        // was actually parsed, which is the step a wrong colour hides behind.
+        std::string HexOf(D2D1_COLOR_F c)
+        {
+            char buf[16];
+            auto byte = [](float v) { return int(v * 255.0f + 0.5f); };
+            snprintf(buf, sizeof(buf), "#%02X%02X%02X%02X", byte(c.r), byte(c.g), byte(c.b), byte(c.a));
+            return buf;
         }
 
         D2D1_COLOR_F ColorFromConfig(const std::string& key)
@@ -144,6 +159,13 @@ namespace vrmpet
             style_.historyLines = capacity;
         }
         historyLines_ = style_.historyLines;
+
+        Log("VRMPet: band style - font '" + Narrow(style_.fontFamily) + "' "
+            + Fmt(style_.fontSize, 1) + "/" + Fmt(style_.statusFontSize, 1)
+            + ", pad " + Fmt(style_.padX, 0) + "x" + Fmt(style_.padY, 0)
+            + ", radius " + Fmt(style_.radius, 0)
+            + "; colors agent " + HexOf(style_.agentColor) + " user " + HexOf(style_.userColor)
+            + " text " + HexOf(style_.textColor) + " meter " + HexOf(style_.meterLive));
     }
 
     bool Bubble::Create(int width, int height)
