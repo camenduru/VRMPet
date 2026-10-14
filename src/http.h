@@ -31,7 +31,10 @@ namespace vrmpet
         std::string body;            // bytes, not necessarily text
         std::string error;           // empty on a completed exchange
         long long   ms = 0;          // wall time for the whole exchange
-        bool Ok() const { return status >= 200 && status < 300; }
+        // A completed exchange is a 2xx with no transport error. The error test
+        // matters: a response truncated mid-body still carries its 200, and
+        // without this an empty or partial TTS clip would read as success.
+        bool Ok() const { return status >= 200 && status < 300 && error.empty(); }
     };
 
     struct HttpHeader

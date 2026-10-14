@@ -31,8 +31,7 @@ namespace vrmpet
 
         const Entry kEntries[] = {
             // --- who the pet is ---------------------------------------------
-            { "fish", "FISH_API_KEY", "",    "your Fish Audio key - the only secret in this file" },
-            { "fish", "FISH_API_BASE", "https://api.fish.audio", "where that key is sent; leave it alone unless you are testing a stub" },
+            { "fish", "FISH_API_KEY", "",    "your Fish Audio key - the only secret in this file" },            { "fish", "FISH_API_BASE", "https://api.fish.audio", "where that key is sent; leave it alone unless you are testing a stub" },
             { "fish", "AGENT",        "",    "the agent's name on fish.audio, exactly as it appears there" },
             { "fish", "MODEL",        "drama-3", "TTS voice model; the valid names are read from the API at startup" },
             { "fish", "GREET",        "",    "what the pet says when it appears; empty means it waits to be spoken to. \\n is a line break" },
@@ -86,6 +85,9 @@ namespace vrmpet
             { "band colors", "band.mic_track_color", "#4D526159", "the mic meter's background" },
             { "band colors", "band.mic_live_color",  "#3DB85CF2", "the meter while the mic is open" },
             { "band colors", "band.mic_muted_color", "#BF423DF2", "the meter while the mic is muted" },
+
+            // --- the log -----------------------------------------------------
+            { "log", "log.enabled", "1", "1: write engine.log (this tool's lines and the engine's); 0: write no log at all" },
         };
 
         const Entry* Find(const std::string& key)
@@ -123,6 +125,11 @@ namespace vrmpet
             items_ = std::move(items);
             break;
         }
+
+        // The file can switch off this tool's own logging, and that switch has
+        // to be honoured before this function's own lines print - otherwise the
+        // very first thing a "quiet" run does is announce itself in the log.
+        SetLogEnabled(Flag("log.enabled"));
 
         if (path_.empty())
         {

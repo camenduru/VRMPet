@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdarg>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iterator>
@@ -155,6 +156,12 @@ namespace vrmpet
     namespace
     {
         std::mutex g_logMutex;
+        std::atomic<bool> g_logEnabled{ true };
+    }
+
+    void SetLogEnabled(bool enabled)
+    {
+        g_logEnabled.store(enabled, std::memory_order_relaxed);
     }
 
     // Every line is stamped with seconds since the process started. A turn is
@@ -163,6 +170,9 @@ namespace vrmpet
     // unstamped log cannot answer without a stopwatch next to it.
     void Log(const std::string& msg)
     {
+        if (!g_logEnabled.load(std::memory_order_relaxed))
+            return;
+
         const double t = NowSeconds();
         char stamp[32];
         snprintf(stamp, sizeof(stamp), "[%8.2f] ", t);

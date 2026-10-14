@@ -44,6 +44,11 @@ namespace vrmpet
     void Log(const std::string& msg);
     void LogFlush();
 
+    // Gate for Log(). config.txt's log.enabled drives it, applied once the file
+    // is read, so it can be turned off per run. The engine's own backlog lines
+    // (shader init, texture allocations) are not affected - only this tool's.
+    void SetLogEnabled(bool enabled);
+
     // -----------------------------------------------------------------------
     // key = value files
     //

@@ -58,6 +58,26 @@ namespace vrmpet
         }
     }
 
+    namespace
+    {
+        // How long a sentence that has been Play()ed may go without the output
+        // device moving its cursor before it is treated as never started. The
+        // sample clock normally ticks within tens of milliseconds; the window is
+        // generous because the device can legitimately be slow to open a stream -
+        // a Bluetooth headset waking from idle can take a second or two to route
+        // audio, and a shorter window dropped the first reply after silence as
+        // "the engine never played this sentence".
+        constexpr double kPlaybackStartTimeout = 4.0;
+
+        // How long a sentence that HAS started may go without the cursor moving
+        // before it is abandoned. Without this there is no recovery from a device
+        // that goes away mid-sentence (headphones unplugged, output switched, a
+        // voice error): the cursor freezes, IsEnded() never fires, the current
+        // sentence is never cleared, and every later reply is drawn as text and
+        // never spoken - the "after a few messages it only answers with text" bug.
+        constexpr double kPlaybackStallTimeout = 3.0;
+    }
+
     // -----------------------------------------------------------------------
     // Speaker
     // -----------------------------------------------------------------------
@@ -72,6 +92,7 @@ namespace vrmpet
             std::string text;
             double startedAt = 0.0;
             int      framesObserved = 0;
+            int      progressLogged = -1;    // whole seconds of playback already logged
             uint64_t lastCursor = 0;     // to detect a voice that never starts
             double   lastMoveAt = 0.0;
             bool     warnedStalled = false;
@@ -256,14 +277,19 @@ namespace vrmpet
             // before a syllable of it is heard. The cursor is the honest signal;
             // IsEnded() is only meaningful once the cursor has moved.
             const bool playingNow = cursor > 0;
-            // The stall rule applies only while the cursor has never moved at all:
-            // once it has, the device is pulling audio and the end of the buffer is
-            // the only thing that ends the sentence. (Applying it unconditionally
-            // truncated the first sentence tried here to 1.5 s.)
-            const bool neverStarted = segment.lastMoveAt == 0.0 && now - segment.startedAt > 1.5;
+            // Two ways a cursor stops being trustworthy, kept apart on purpose.
+            // neverStarted: the device never pulled anything - a slow-to-open
+            // stream, so the reply is dropped rather than blocked on forever.
+            // stalled: it did start and then went quiet mid-sentence (device
+            // switched, unplugged, or a voice error), which is also a dead end
+            // without a watchdog.
+            const bool neverStarted = segment.lastMoveAt == 0.0
+                && now - segment.startedAt > kPlaybackStartTimeout;
+            const bool stalled = playingNow && segment.lastMoveAt != 0.0
+                && now - segment.lastMoveAt > kPlaybackStallTimeout;
             const bool ended = (playingNow && (wi::audio::IsEnded(&segment.instance)
                                                || readAt >= segment.samples.size()))
-                || neverStarted;
+                || neverStarted || stalled;
 
             // So the first frame or two report the real state rather than a
             // guess, and a reply really became audible or really did not.
@@ -276,11 +302,41 @@ namespace vrmpet
                     + std::to_string(wi::audio::IsEnded(&segment.instance) ? 1 : 0)
                     + ", mouth " + Fmt(target, 3));
             }
+            else if (int(now - segment.startedAt) > segment.progressLogged)
+            {
+                // One line per whole second, so a clip that stops advancing is
+                // visible as the second on which the cursor stopped moving.
+                segment.progressLogged = int(now - segment.startedAt);
+                Log("VRMPet: playing " + std::to_string(cursor) + "/"
+                    + std::to_string(segment.samples.size()) + " samples after "
+                    + Fmt(float(now - segment.startedAt), 1) + "s, engine ended="
+                    + std::to_string(wi::audio::IsEnded(&segment.instance) ? 1 : 0)
+                    + ", device pulling="
+                    + std::to_string(segment.lastMoveAt != 0.0
+                                     && now - segment.lastMoveAt < kPlaybackStallTimeout ? 1 : 0));
+            }
 
             if (!ended)
                 break;
 
-            if (!playingNow && !segment.warnedStalled)
+            // Why the sentence stopped, so a cut-off clip is attributable without
+            // guessing: a real end, the buffer running out, or a wedged device.
+            const char* reason = neverStarted ? "device never started"
+                : stalled ? "device stalled mid-sentence"
+                : (readAt >= segment.samples.size()) ? "buffer exhausted"
+                : "voice signalled end";
+            Log("VRMPet: sentence ended - " + std::string(reason) + " at "
+                + std::to_string(cursor) + "/" + std::to_string(segment.samples.size())
+                + " samples after " + Fmt(float(now - segment.startedAt), 2) + "s");
+
+            if (stalled && !segment.warnedStalled)
+            {
+                segment.warnedStalled = true;
+                Log("VRMPet: WARNING - the output device stopped mid-sentence at sample "
+                    + std::to_string(cursor) + "/" + std::to_string(segment.samples.size())
+                    + "; dropping the rest so later replies still speak. Check the playback device.");
+            }
+            else if (!playingNow && !segment.warnedStalled)
             {
                 segment.warnedStalled = true;
                 Log("VRMPet: WARNING - the engine never played this sentence. The sound "
@@ -649,6 +705,11 @@ namespace vrmpet
         agentMs = result.ms;
         reply = Trim(reply);
 
+        // The reply as text, so the voice log can be read against what was
+        // actually asked to be spoken.
+        Log("VRMPet: reply (" + std::to_string(reply.size()) + " chars) - \""
+            + reply.substr(0, 240) + (reply.size() > 240 ? "..." : "") + "\"");
+
         history.push_back({ "agent", reply });
         if (history.size() > 16)
             history.erase(history.begin(), history.begin() + (history.size() - 16));
@@ -669,11 +730,35 @@ namespace vrmpet
         // Sentence by sentence, so the first audio starts while the rest is
         // still being synthesized.
         const std::vector<std::string> chunks = SplitSentences(reply);
+        // A TTS request that fails transiently - a dropped or truncated
+        // connection, a 5xx, a 429 - would otherwise silence the rest of a reply
+        // whose text is already on screen. Those are retried; a 4xx is a real
+        // refusal and is not.
+        auto speakSentence = [&](const std::string& sentence,
+                                 std::vector<int16_t>& samples, FishResult& tts) -> bool
+        {
+            for (int attempt = 0; ; ++attempt)
+            {
+                if (fish.Tts(sentence, samples, tts))
+                    return true;
+                // Retry anything that is not a definitive client refusal. A 4xx
+                // (other than a 429 rate limit) is a real "no"; everything else -
+                // a dropped connection (status 0), a 5xx, a rate limit, or a 2xx
+                // whose body was truncated in transit - is worth another try.
+                const bool clientRefusal = tts.status >= 400 && tts.status < 500 && tts.status != 429;
+                if (clientRefusal || attempt >= 2)
+                    return false;
+                Log("VRMPet: tts failed (" + tts.error + "); retrying ("
+                    + std::to_string(attempt + 2) + "/3)");
+                std::this_thread::sleep_for(std::chrono::milliseconds(300 * (attempt + 1)));
+            }
+        };
+
         for (size_t i = 0; i < chunks.size(); ++i)
         {
             std::vector<int16_t> samples;
             FishResult tts;
-            if (!fish.Tts(chunks[i], samples, tts))
+            if (!speakSentence(chunks[i], samples, tts))
             {
                 Fail("Could not speak sentence " + std::to_string(i + 1) + " of "
                      + std::to_string(chunks.size()) + ": " + tts.error);

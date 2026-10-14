@@ -145,3 +145,7 @@ band.mic_live_color = #3DB85CF2
 
 # the meter while the mic is muted
 band.mic_muted_color = #BF423DF2
+
+# --- log ---
+# 1: write engine.log (this tool's lines and the engine's); 0: write no log at all
+log.enabled = 1

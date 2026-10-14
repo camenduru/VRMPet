@@ -581,6 +581,14 @@ namespace vrmpet
         if (!ttsModel_.empty())
             headers.push_back({ L"model", Widen(ttsModel_) });
 
+        // The whole voice path is logged so a silent reply can be traced: this
+        // line says what was asked for, the HTTP line (in HttpRequest) says what
+        // came back, and the "engine decoded" line in the speaker says whether it
+        // was playable.
+        Log("VRMPet: tts request - " + std::to_string(body["text"].get<std::string>().size())
+            + " chars, model '" + (ttsModel_.empty() ? std::string("(fish default)") : ttsModel_)
+            + "', voice " + (agent_.voiceId.empty() ? std::string("(agent default)") : agent_.voiceId));
+
         HttpResponse response;
         HttpRequest("POST", base_ + "/v1/tts", headers, body.dump(), response);
         out.status = response.status;
@@ -588,6 +596,7 @@ namespace vrmpet
         if (!response.Ok())
         {
             out.error = Describe(response);
+            Log("VRMPet: tts failed - " + out.error);
             return false;
         }
 
@@ -607,16 +616,25 @@ namespace vrmpet
             {
                 out.error = "the reply is not headerless pcm (" + std::to_string(response.body.size())
                     + " bytes) and not a playable wav: " + why;
+                Log("VRMPet: tts failed - " + out.error);
                 return false;
             }
             out.error = "the reply is not headerless pcm (" + std::to_string(response.body.size())
                 + " bytes)";
+            Log("VRMPet: tts failed - " + out.error);
             return false;
         }
 
         const size_t count = response.body.size() / 2;
         samples.resize(count);
         memcpy(samples.data(), response.body.data(), response.body.size());
+
+        // What came back, as samples and seconds, so a clipped clip is visible
+        // here even before it is played.
+        Log("VRMPet: tts ok - " + std::to_string(count) + " samples ("
+            + Fmt(float(count) / 16000.0f, 2) + "s), "
+            + std::to_string(response.body.size()) + " bytes, "
+            + std::to_string(response.ms) + " ms");
 
         out.ok = true;
         return true;

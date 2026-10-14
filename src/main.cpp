@@ -222,12 +222,12 @@ namespace
         {
             if (wi::helper::FileExists(candidate))
             {
-                wi::backlog::post("VRMPet: resolved '" + path + "' -> " + candidate);
+                Log("VRMPet: resolved '" + path + "' -> " + candidate);
                 return candidate;
             }
         }
 
-        wi::backlog::post("VRMPet: WARNING - '" + path + "' not found relative to '"
+        Log("VRMPet: WARNING - '" + path + "' not found relative to '"
             + exeDir + "' or the working directory");
         return path;
     }
@@ -516,7 +516,7 @@ namespace
             switch (id)
             {
             case 1:
-                wi::backlog::post("VRMPet: closed from the menu");
+                Log("VRMPet: closed from the menu");
                 wi::backlog::Flush();
                 PostQuitMessage(0);
                 break;
@@ -560,13 +560,13 @@ namespace
                                                    nullptr, nullptr, SW_SHOWNORMAL);
             if (INT_PTR(result) <= 32)
             {
-                wi::backlog::post("VRMPet: could not open " + path + " (ShellExecute returned "
+                Log("VRMPet: could not open " + path + " (ShellExecute returned "
                                   + std::to_string((long long)result) + ") - open it by hand");
                 wi::backlog::Flush();
             }
             else
             {
-                wi::backlog::post("VRMPet: opened " + path);
+                Log("VRMPet: opened " + path);
                 wi::backlog::Flush();
             }
         }
@@ -584,7 +584,7 @@ namespace
             self.y = homeY;
             SetWindowPos(hWnd, HWND_TOPMOST, homeX, homeY, self.w, self.h,
                          SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            wi::backlog::post("VRMPet: overlay moved back to " + std::to_string(homeX) + ","
+            Log("VRMPet: overlay moved back to " + std::to_string(homeX) + ","
                               + std::to_string(homeY));
             wi::backlog::Flush();
         }
@@ -629,7 +629,7 @@ namespace
             case WM_HOTKEY:
                 if (wParam == 1)
                 {
-                    wi::backlog::post("VRMPet: overlay hotkey - quitting");
+                    Log("VRMPet: overlay hotkey - quitting");
                     wi::backlog::Flush();
                     PostQuitMessage(0);
                 }
@@ -1039,13 +1039,18 @@ public:
         wi::Application::Initialize();
 
         // Route the engine's own log to disk. Without this a standalone GUI app
-        // has no visible output at all and failures are silent.
+        // has no visible output at all and failures are silent. log.enabled = 0
+        // skips both the file and the engine's own lines, so a quiet run leaves
+        // no engine.log behind at all.
         EnsureDirectory(g_outDir);
-        wi::backlog::SetLogFile(g_outDir + "/engine.log");
-        wi::backlog::SetLogLevel(wi::backlog::LogLevel::Default);
-        wi::backlog::post("VRMPet: === initialize ===");
-        wi::backlog::post("VRMPet: shader binary path = " + wi::renderer::GetShaderPath());
-        wi::backlog::post("VRMPet: shader source path = " + wi::renderer::GetShaderSourcePath());
+        if (vrmpet::Settings().Flag("log.enabled"))
+        {
+            wi::backlog::SetLogFile(g_outDir + "/engine.log");
+            wi::backlog::SetLogLevel(wi::backlog::LogLevel::Default);
+        }
+        Log("VRMPet: === initialize ===");
+        Log("VRMPet: shader binary path = " + wi::renderer::GetShaderPath());
+        Log("VRMPet: shader source path = " + wi::renderer::GetShaderSourcePath());
         wi::backlog::Flush();
 
         // Relative asset paths resolve against the working directory first, then
@@ -1074,16 +1079,16 @@ public:
         // from "they did not".
         {
             const wi::scene::CameraComponent local{};
-            wi::backlog::post("VRMPet: probe local ctor near=" + Fmt(local.zNearP)
+            Log("VRMPet: probe local ctor near=" + Fmt(local.zNearP)
                 + " far=" + Fmt(local.zFarP)
                 + " fov=" + Fmt(local.fov)
                 + " sizeof=" + std::to_string(sizeof(wi::scene::CameraComponent)));
         }
 
-        wi::backlog::post("VRMPet: probe boot (sampled at wWinMain entry, pre-engine) near="
+        Log("VRMPet: probe boot (sampled at wWinMain entry, pre-engine) near="
             + Fmt(g_bootNear) + " far=" + Fmt(g_bootFar) + " fov=" + Fmt(g_bootFov));
 
-        wi::backlog::post("VRMPet: probe pre-path global cam near="
+        Log("VRMPet: probe pre-path global cam near="
             + Fmt(wi::scene::GetCamera().zNearP)
             + " far=" + Fmt(wi::scene::GetCamera().zFarP)
             + " fov=" + Fmt(wi::scene::GetCamera().fov)
@@ -1109,7 +1114,7 @@ public:
         // textures we capture from.
         onFrameComplete = [this]() { OnFrameComplete(); };
 
-        wi::backlog::post("VRMPet: probe post-path path cam near=" + Fmt(path->camera->zNearP)
+        Log("VRMPet: probe post-path path cam near=" + Fmt(path->camera->zNearP)
             + " far=" + Fmt(path->camera->zFarP)
             + " fov=" + Fmt(path->camera->fov)
             + " same_object=" + std::to_string(path->camera == &wi::scene::GetCamera() ? 1 : 0)
@@ -1197,7 +1202,7 @@ public:
             SaveMask("background.png", wi::enums::STENCILREF_EMPTY,
                      wi::image::STENCILMODE_ALWAYS, wi::image::STENCILREFMODE_ALL);
             stage = Stage::Finished;
-            wi::backlog::post("VRMPet: === done ===");
+            Log("VRMPet: === done ===");
             wi::backlog::Flush();
             PostQuitMessage(0);
             break;
@@ -1315,6 +1320,13 @@ private:
         // assets use, so it works from build/run, from the project root and from
         // a shortcut with any working directory at all.
         const std::vector<std::string> configDirs = ConfigSearchPath();
+
+        // The engine's audio (XAudio2) is initialised by the engine itself, on
+        // its own thread, before this runs. Log what it came up with - master
+        // volume above all, because a muted master reads exactly like "the voice
+        // is gone" from the outside and nothing else reports it.
+        Log("VRMPet: audio master volume " + Fmt(wi::audio::GetVolume(nullptr), 2)
+            + " (1.00 is full; 0.00 is silent)");
 
         call.Configure(configDirs);
 
@@ -1493,7 +1505,7 @@ private:
                     "(%d px of margin)",
                     cropW, cropH, cropX, cropY, -worst);
             }
-            wi::backlog::post(buf);
+            Log(buf);
             wi::backlog::Flush();
         }
     }
@@ -1508,7 +1520,7 @@ private:
         wi::vector<uint8_t> rgba;
         if (!wi::helper::saveTextureToMemory(tex, rgba))
         {
-            wi::backlog::post("VRMPet: overlay readback FAILED");
+            Log("VRMPet: overlay readback FAILED");
             wi::backlog::Flush();
             return;
         }
@@ -1643,7 +1655,7 @@ private:
             char buf[160];
             snprintf(buf, sizeof(buf), "VRMPet: overlay %.1f fps over %.0fs (%lld frames)",
                      double(overlayFrames) / elapsed, elapsed, overlayFrames);
-            wi::backlog::post(buf);
+            Log(buf);
             wi::backlog::Flush();
             overlayFrames = 0;
             overlayClock = std::chrono::steady_clock::now();
@@ -1680,29 +1692,29 @@ private:
 
         if (g_animPath.empty() || g_animPath == "-" || g_animPath == "none")
         {
-            wi::backlog::post("VRMPet: animation disabled");
+            Log("VRMPet: animation disabled");
             return;
         }
 
         if (scene.humanoids.GetCount() == 0)
         {
-            wi::backlog::post("VRMPet: " + g_modelPath
+            Log("VRMPet: " + g_modelPath
                 + " imported no humanoid - cannot retarget " + g_animPath);
             return;
         }
         const wi::ecs::Entity avatarRoot = scene.humanoids.GetEntity(0);
 
         wi::scene::Scene animScene;
-        wi::backlog::post("VRMPet: loading animation " + g_animPath);
+        Log("VRMPet: loading animation " + g_animPath);
         ImportModel_GLTF(g_animPath, animScene);
-        wi::backlog::post("VRMPet: animation import returned  nodes="
+        Log("VRMPet: animation import returned  nodes="
             + std::to_string(animScene.transforms.GetCount())
             + " humanoids=" + std::to_string(animScene.humanoids.GetCount())
             + " animations=" + std::to_string(animScene.animations.GetCount()));
 
         if (animScene.humanoids.GetCount() == 0 || animScene.animations.GetCount() == 0)
         {
-            wi::backlog::post("VRMPet: " + g_animPath
+            Log("VRMPet: " + g_animPath
                 + " has no humanoid or no animation - nothing to retarget");
             return;
         }
@@ -1755,7 +1767,7 @@ private:
             }
         }
 
-        wi::backlog::post("VRMPet: retargeting '" + animName + "'  bones_in_common="
+        Log("VRMPet: retargeting '" + animName + "'  bones_in_common="
             + std::to_string(commonBones) + "/" + std::to_string(kBoneCount)
             + "  channels=" + std::to_string(srcAnim.channels.size())
             + "  dropped=" + std::to_string(dropped)
@@ -1766,7 +1778,7 @@ private:
             scene.RetargetAnimation(avatarRoot, animSource, true, &animScene);
         if (retargeted == wi::ecs::INVALID_ENTITY)
         {
-            wi::backlog::post("VRMPet: RetargetAnimation() found no usable channel");
+            Log("VRMPet: RetargetAnimation() found no usable channel");
             wi::backlog::Flush();
             return;
         }
@@ -1774,7 +1786,7 @@ private:
         wi::scene::AnimationComponent* anim = scene.animations.GetComponent(retargeted);
         if (anim == nullptr)
         {
-            wi::backlog::post("VRMPet: retargeted animation has no component");
+            Log("VRMPet: retargeted animation has no component");
             wi::backlog::Flush();
             return;
         }
@@ -1787,7 +1799,7 @@ private:
         anim->timer = 0.0f;
         anim->last_update_time = 0.0f;
 
-        wi::backlog::post("VRMPet: animation playing - "
+        Log("VRMPet: animation playing - "
             + std::to_string(anim->channels.size()) + " channels retargeted onto "
             + std::to_string(anim->samplers.size()) + " samplers, looped over "
             + Fmt(anim->end - anim->start) + "s");
@@ -1798,11 +1810,11 @@ private:
     {
         wi::scene::Scene& scene = wi::scene::GetScene();
 
-        wi::backlog::post("VRMPet: loading " + g_modelPath);
+        Log("VRMPet: loading " + g_modelPath);
         ImportModel_GLTF(g_modelPath, scene);
-        wi::backlog::post("VRMPet: import returned");
+        Log("VRMPet: import returned");
 
-        wi::backlog::post("VRMPet: objects=" + std::to_string(scene.objects.GetCount())
+        Log("VRMPet: objects=" + std::to_string(scene.objects.GetCount())
             + " meshes="    + std::to_string(scene.meshes.GetCount())
             + " materials=" + std::to_string(scene.materials.GetCount())
             + " humanoids=" + std::to_string(scene.humanoids.GetCount())
@@ -1812,7 +1824,7 @@ private:
         {
             const wi::scene::MeshComponent& mesh = scene.meshes[i];
             const wi::primitive::AABB& b = mesh.aabb;
-            wi::backlog::post("VRMPet:   mesh[" + std::to_string(i) + "] subsets="
+            Log("VRMPet:   mesh[" + std::to_string(i) + "] subsets="
                 + std::to_string(mesh.subsets.size())
                 + " aabb=" + Fmt(b.getMin().x) + "," + Fmt(b.getMin().y) + "," + Fmt(b.getMin().z)
                 + " .. "  + Fmt(b.getMax().x) + "," + Fmt(b.getMax().y) + "," + Fmt(b.getMax().z));
@@ -1828,7 +1840,7 @@ private:
                     if (nc != nullptr)
                         mname = nc->name;
                 }
-                wi::backlog::post("VRMPet:      subset[" + std::to_string(j) + "] matIndex="
+                Log("VRMPet:      subset[" + std::to_string(j) + "] matIndex="
                     + std::to_string(sub.materialIndex)
                     + " indices=" + std::to_string(sub.indexCount)
                     + " mat='" + mname + "'");
@@ -1853,7 +1865,7 @@ private:
                 kind = "BLEND";
             else if (mat.alphaRef < 1.0f)
                 kind = "MASK";
-            wi::backlog::post("VRMPet:   mat[" + std::to_string(i) + "] '" + mname
+            Log("VRMPet:   mat[" + std::to_string(i) + "] '" + mname
                 + "' " + kind
                 + " blendMode=" + std::to_string((int)mat.userBlendMode)
                 + " alphaRef=" + Fmt(mat.alphaRef)
@@ -1891,7 +1903,7 @@ private:
         if (wi::scene::HumanoidComponent* hum = scene.humanoids.GetComponent(scene.humanoids.GetEntity(0)))
         {
             hum->SetLookAtEnabled(g_lookAtCamera);
-            wi::backlog::post(std::string("VRMPet: look-at solver ")
+            Log(std::string("VRMPet: look-at solver ")
                 + (g_lookAtCamera ? "ON - aimed at the camera" : "OFF - head follows the neck"));
         }
 
@@ -1936,7 +1948,7 @@ private:
                     ++hidden;
                 }
             }
-            wi::backlog::post("VRMPet: isolate mesh " + std::to_string(g_isolateMesh)
+            Log("VRMPet: isolate mesh " + std::to_string(g_isolateMesh)
                 + " - hid " + std::to_string(hidden) + " of "
                 + std::to_string(scene.objects.GetCount()) + " objects");
         }
@@ -1947,22 +1959,22 @@ private:
     void DumpSceneState()
     {
         wi::scene::Scene& scene = wi::scene::GetScene();
-        wi::backlog::post("VRMPet: --- scene state at capture ---");
+        Log("VRMPet: --- scene state at capture ---");
 
         if (const wi::graphics::Texture* pp = path->GetLastPostprocessRT())
         {
-            wi::backlog::post("VRMPet: postprocessRT valid=" + std::to_string(pp->IsValid() ? 1 : 0)
+            Log("VRMPet: postprocessRT valid=" + std::to_string(pp->IsValid() ? 1 : 0)
                 + " " + std::to_string(pp->desc.width) + "x" + std::to_string(pp->desc.height)
                 + " fmt=" + std::to_string((int)pp->desc.format));
         }
         else
         {
-            wi::backlog::post("VRMPet: postprocessRT is NULL");
+            Log("VRMPet: postprocessRT is NULL");
         }
 
-        wi::backlog::post("VRMPet: activePath=" + std::to_string(GetActivePath() != nullptr ? 1 : 0));
-        wi::backlog::post("VRMPet: gameSpeed=" + Fmt(wi::renderer::GetGameSpeed()));
-        wi::backlog::post("VRMPet: scene camera entities=" + std::to_string(scene.cameras.GetCount()));
+        Log("VRMPet: activePath=" + std::to_string(GetActivePath() != nullptr ? 1 : 0));
+        Log("VRMPet: gameSpeed=" + Fmt(wi::renderer::GetGameSpeed()));
+        Log("VRMPet: scene camera entities=" + std::to_string(scene.cameras.GetCount()));
 
         // Which way is the face actually pointing? Reading it off a screenshot is
         // guesswork; reading it off the bones is not. The eye bones give the
@@ -1993,7 +2005,7 @@ private:
             const XMFLOAT3 R = pos(HumanoidComponent::HumanoidBone::RightEye, okR);
             const XMFLOAT3 H = pos(HumanoidComponent::HumanoidBone::Head, okH);
 
-            wi::backlog::post("VRMPet: headbone pos=" + Fmt(H.x) + "," + Fmt(H.y) + "," + Fmt(H.z)
+            Log("VRMPet: headbone pos=" + Fmt(H.x) + "," + Fmt(H.y) + "," + Fmt(H.z)
                 + "  lefteye_valid=" + std::to_string(okL)
                 + " righteye_valid=" + std::to_string(okR)
                 + " head_valid=" + std::to_string(okH));
@@ -2005,7 +2017,7 @@ private:
             // way. default_facing is a heuristic the engine fills in from the
             // shoulder rest positions, so it is worth seeing next to the head's
             // actual axes.
-            wi::backlog::post("VRMPet: humanoid default_facing=" + Fmt(hum.default_facing)
+            Log("VRMPet: humanoid default_facing=" + Fmt(hum.default_facing)
                 + " knee_bending=" + Fmt(hum.knee_bending)
                 + " lookat_enabled=" + std::to_string(hum.IsLookAtEnabled() ? 1 : 0)
                 + " lookAt_target=" + Fmt(hum.lookAt.x) + "," + Fmt(hum.lookAt.y) + "," + Fmt(hum.lookAt.z));
@@ -2017,7 +2029,7 @@ private:
                 // -X in world space once the importer has turned it around).
                 const XMFLOAT3 axis = XMFLOAT3(L.x - R.x, L.y - R.y, L.z - R.z);
                 const float yaw = atan2f(axis.z, -axis.x) * 180.0f / XM_PI;
-                wi::backlog::post("VRMPet: eye axis=" + Fmt(axis.x) + "," + Fmt(axis.y) + "," + Fmt(axis.z)
+                Log("VRMPet: eye axis=" + Fmt(axis.x) + "," + Fmt(axis.y) + "," + Fmt(axis.z)
                     + "  |axis|=" + Fmt(sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z))
                     + "  head_yaw=" + Fmt(yaw) + " deg");
             }
@@ -2028,7 +2040,7 @@ private:
                 const XMFLOAT3 fwd = htr->GetForward();
                 const XMFLOAT3 rgt = htr->GetRight();
                 const XMFLOAT3 up  = htr->GetUp();
-                wi::backlog::post("VRMPet: head world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
+                Log("VRMPet: head world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
                     + " right=" + Fmt(rgt.x) + "," + Fmt(rgt.y) + "," + Fmt(rgt.z)
                     + " up=" + Fmt(up.x) + "," + Fmt(up.y) + "," + Fmt(up.z));
             }
@@ -2038,7 +2050,7 @@ private:
             {
                 const XMFLOAT3 fwd = ntr->GetForward();
                 const XMFLOAT3 rgt = ntr->GetRight();
-                wi::backlog::post("VRMPet: neck world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
+                Log("VRMPet: neck world fwd=" + Fmt(fwd.x) + "," + Fmt(fwd.y) + "," + Fmt(fwd.z)
                     + " right=" + Fmt(rgt.x) + "," + Fmt(rgt.y) + "," + Fmt(rgt.z));
             }
         }
@@ -2048,10 +2060,10 @@ private:
             // Address identity: if path->camera is not the global GetCamera()
             // static, then the render path is rendering with a different camera
             // than the one this tool configures, which would explain a blank frame.
-            wi::backlog::post("VRMPet: camaddr path=" + std::to_string((uintptr_t)&cam)
+            Log("VRMPet: camaddr path=" + std::to_string((uintptr_t)&cam)
                 + " global=" + std::to_string((uintptr_t)&wi::scene::GetCamera())
                 + " scene=" + std::to_string((uintptr_t)&scene.camera));
-            wi::backlog::post("VRMPet: cam w=" + Fmt(cam.width) + " h=" + Fmt(cam.height)
+            Log("VRMPet: cam w=" + Fmt(cam.width) + " h=" + Fmt(cam.height)
                 + " near=" + Fmt(cam.zNearP) + " far=" + Fmt(cam.zFarP)
                 + " fov=" + Fmt(cam.fov)
                 + " VP[0]=" + Fmt(cam.VP._11) + "," + Fmt(cam.VP._22) + "," + Fmt(cam.VP._33)
@@ -2063,7 +2075,7 @@ private:
             const wi::scene::ObjectComponent& obj = scene.objects[i];
             const wi::ecs::Entity e = scene.objects.GetEntity(i);
 
-            wi::backlog::post("VRMPet:   obj[" + std::to_string(i) + "] entity=" + std::to_string(e)
+            Log("VRMPet:   obj[" + std::to_string(i) + "] entity=" + std::to_string(e)
                 + " mesh=" + std::to_string(obj.meshID)
                 + " renderable=" + std::to_string(obj.IsRenderable() ? 1 : 0)
                 + " transparency=" + Fmt(obj.GetTransparency())
@@ -2075,7 +2087,7 @@ private:
 
             if (const wi::scene::TransformComponent* tr = scene.transforms.GetComponent(e))
             {
-                wi::backlog::post("VRMPet:      translation="
+                Log("VRMPet:      translation="
                     + Fmt(tr->translation_local.x) + "," + Fmt(tr->translation_local.y) + "," + Fmt(tr->translation_local.z)
                     + " scale=" + Fmt(tr->scale_local.x) + "," + Fmt(tr->scale_local.y) + "," + Fmt(tr->scale_local.z));
             }
@@ -2139,7 +2151,7 @@ private:
             box = scene.bounds;
         }
 
-        wi::backlog::post("VRMPet: frame box valid=" + std::to_string(box.IsValid() ? 1 : 0)
+        Log("VRMPet: frame box valid=" + std::to_string(box.IsValid() ? 1 : 0)
             + " min=" + Fmt(box.getMin().x) + "," + Fmt(box.getMin().y) + "," + Fmt(box.getMin().z)
             + " max=" + Fmt(box.getMax().x) + "," + Fmt(box.getMax().y) + "," + Fmt(box.getMax().z));
 
@@ -2176,7 +2188,7 @@ private:
 
         if (std::fabs(Zoom() - 1.0f) > 0.001f)
         {
-            wi::backlog::post("VRMPet: avatar.zoom " + Fmt(Zoom(), 2) + " - render target "
+            Log("VRMPet: avatar.zoom " + Fmt(Zoom(), 2) + " - render target "
                               + std::to_string(RenderSize()) + " px (base "
                               + std::to_string(WindowSize()) + ", framing distance "
                               + Fmt(dist, 2) + " unchanged)");
@@ -2212,14 +2224,14 @@ private:
         // produced a VP for the wrong pose.
         cam.UpdateCamera();
 
-        wi::backlog::post("VRMPet: camera fov=" + Fmt(cam.fov)
+        Log("VRMPet: camera fov=" + Fmt(cam.fov)
             + " eye=" + Fmt(cam.Eye.x) + "," + Fmt(cam.Eye.y) + "," + Fmt(cam.Eye.z)
             + " dir=" + Fmt(cam.At.x) + "," + Fmt(cam.At.y) + "," + Fmt(cam.At.z)
             + " dist=" + Fmt(dist) + " radius=" + Fmt(radius));
 
         // Read the projection back so a bad one is visible in the log rather than
         // showing up only as an empty stencil mask.
-        wi::backlog::post("VRMPet: proj w=" + Fmt(cam.width) + " h=" + Fmt(cam.height)
+        Log("VRMPet: proj w=" + Fmt(cam.width) + " h=" + Fmt(cam.height)
             + " near=" + Fmt(cam.zNearP) + " far=" + Fmt(cam.zFarP)
             + " custom=" + std::to_string(cam.IsCustomProjectionEnabled() ? 1 : 0)
             + " ortho=" + std::to_string(cam.IsOrtho() ? 1 : 0)
@@ -2235,7 +2247,7 @@ private:
         {
             scene.objects[i].SetRenderable(false);
         }
-        wi::backlog::post("VRMPet: hid " + std::to_string(scene.objects.GetCount())
+        Log("VRMPet: hid " + std::to_string(scene.objects.GetCount())
             + " objects for the background reference");
         wi::backlog::Flush();
     }
@@ -2247,7 +2259,7 @@ private:
         {
             scene.objects[i].SetUserStencilRef(kUserStencilRef);
         }
-        wi::backlog::post("VRMPet: tagged " + std::to_string(scene.objects.GetCount())
+        Log("VRMPet: tagged " + std::to_string(scene.objects.GetCount())
             + " objects with user stencil ref " + std::to_string(kUserStencilRef));
         wi::backlog::Flush();
     }
@@ -2257,7 +2269,7 @@ private:
         const wi::graphics::Texture& tex = path->GetRenderResult3D();
         const std::string file = g_outDir + "/color.png";
         const bool ok = wi::helper::saveTextureToFile(tex, file);
-        wi::backlog::post("VRMPet: saved " + file + (ok ? " OK" : " FAILED"));
+        Log("VRMPet: saved " + file + (ok ? " OK" : " FAILED"));
     }
 
     void SaveMask(const std::string& fileName,
@@ -2268,7 +2280,7 @@ private:
         wi::graphics::Texture tex = path->CreateScreenshotWithAlphaBackground(stencilRef, stencilMode, refMode);
         const std::string file = g_outDir + "/" + fileName;
         const bool ok = wi::helper::saveTextureToFile(tex, file);
-        wi::backlog::post("VRMPet: saved " + file + (ok ? " OK" : " FAILED"));
+        Log("VRMPet: saved " + file + (ok ? " OK" : " FAILED"));
         wi::backlog::Flush();
     }
 };
@@ -2533,7 +2545,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         // global hotkey there would be no way to close it.
         if (!RegisterHotKey(hWnd, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'Q'))
         {
-            wi::backlog::post("VRMPet: WARNING - could not register Ctrl+Shift+Q");
+            Log("VRMPet: WARNING - could not register Ctrl+Shift+Q");
             wi::backlog::Flush();
         }
     }
@@ -2555,7 +2567,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                     std::chrono::steady_clock::now() - startTime).count();
                 if (elapsed >= double(g_overlaySecs))
                 {
-                    wi::backlog::post("VRMPet: overlay reached its "
+                    Log("VRMPet: overlay reached its "
                         + std::to_string(g_overlaySecs) + "s limit - quitting");
                     wi::backlog::Flush();
                     break;

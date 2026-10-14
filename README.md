@@ -50,6 +50,7 @@ Other useful keys:
 | `avatar.zoom` | pet size, `1.0` as framed, up to `4.0` |
 | `band.visible` | `0` to start with no speech bubbles |
 | `overlay.margin` | gap in px from the screen edge |
+| `log.enabled` | `0` to write no log at all (no `engine.log`) |
 
 To regenerate a fresh file with every key:
 
