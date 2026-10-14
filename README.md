@@ -1,5 +1,7 @@
 # VRMPet
 
+https://github.com/user-attachments/assets/0b00a221-95b1-4a5e-99cf-996037bb92e1
+
 A VRM avatar that stands on your Windows desktop and talks, using Fish Audio for
 speech-to-text and text-to-speech plus its agent as the LLM. The avatar is drawn
 into a layered, click-through overlay window, so there is no frame and no
