@@ -1,4 +1,5 @@
 #include "fish.h"
+#include "config.h"
 #include "http.h"
 #include "util.h"
 #include "voice.h"
@@ -154,25 +155,136 @@ namespace vrmpet
         }
     }
 
-    bool FishClient::Configure(const std::vector<std::string>& envDirs)
+    namespace
     {
-        Env& env = Environment();
-        if (env.Load(envDirs))
+        bool InList(const std::vector<std::string>& list, const std::string& value)
         {
-            envPath_ = env.Path();
+            return std::find(list.begin(), list.end(), value) != list.end();
         }
 
-        base_      = env.Get("FISH_API_BASE", "https://api.fish.audio");
-        key_       = env.Get("FISH_API_KEY");
-        agentName_ = env.Get("AGENT");
-        ttsModel_  = env.Get("FISH_TTS_MODEL", "drama-3-preview");
+        std::string JoinList(const std::vector<std::string>& list)
+        {
+            std::string out;
+            for (const std::string& item : list)
+            {
+                if (!out.empty())
+                    out += ", ";
+                out += item;
+            }
+            return out;
+        }
+    }
+
+    bool FishClient::FetchTtsModels()
+    {
+        ttsModels_.clear();
+        modelListError_.clear();
+
+        FishResult result;
+        json doc;
+        if (!GetJson(base_ + "/openapi.json", key_, doc, result))
+        {
+            modelListError_ = result.error.empty() ? ("HTTP " + std::to_string(result.status))
+                                                   : result.error;
+            return false;
+        }
+
+        // paths -> /v1/tts -> post -> parameters -> the `model` header -> its
+        // schema -> enum. Walked defensively: this is somebody else's document
+        // and a single missing key must not take the process down with it.
+        const json* node = &doc;
+        for (const char* field : { "paths", "/v1/tts", "post", "parameters" })
+        {
+            if (!node->is_object() || !node->contains(field))
+            {
+                modelListError_ = std::string("the document has no '") + field + "' at that point";
+                return false;
+            }
+            node = &(*node)[field];
+        }
+        if (!node->is_array())
+        {
+            modelListError_ = "the parameter list is not a list";
+            return false;
+        }
+
+        for (const json& parameter : *node)
+        {
+            if (parameter.value("in", "") != "header" || parameter.value("name", "") != "model")
+                continue;
+            if (!parameter.contains("schema"))
+                continue;
+            const json& schema = parameter["schema"];
+            if (schema.contains("enum") && schema["enum"].is_array())
+            {
+                for (const json& item : schema["enum"])
+                {
+                    if (item.is_string())
+                        ttsModels_.push_back(item.get<std::string>());
+                }
+            }
+            break;
+        }
+
+        if (ttsModels_.empty())
+        {
+            modelListError_ = "the `model` header carries no enum";
+            return false;
+        }
+        return true;
+    }
+
+    bool FishClient::Configure(const std::vector<std::string>& configDirs)
+    {
+        Config& config = Settings();
+        config.Load(configDirs);
+
+        base_      = config.Text("FISH_API_BASE");
+        key_       = config.Text("FISH_API_KEY");
+        agentName_ = config.Text("AGENT");
+
+        // MODEL is the TTS voice. An empty value is a deliberate "let Fish
+        // choose", which is a different state from "the file says nothing" -
+        // hence Default() being consulted rather than a hard fallback here.
+        ttsModel_    = config.Text("MODEL");
+        modelSource_ = config.Path().empty() ? "built-in default"
+                                             : config.Path() + " MODEL";
+
+        // The names Fish accepts are read from the API, not listed here, so a
+        // model added later is usable with no rebuild. The check is a warning,
+        // never a gate: a name this document has not caught up with is still
+        // worth trying, and the send below happens either way.
+        if (ttsModel_.empty())
+        {
+            Log("VRMPet: tts model none - MODEL is set but empty, so no `model` header is sent "
+                "and Fish picks its own default");
+        }
+        else if (FetchTtsModels())
+        {
+            Log("VRMPet: tts model '" + ttsModel_ + "' from " + modelSource_ + " - fish offers "
+                + std::to_string(ttsModels_.size()) + ": " + JoinList(ttsModels_));
+            if (!InList(ttsModels_, ttsModel_))
+            {
+                Log("VRMPet: WARNING - '" + ttsModel_ + "' is not one of those names. Fish answers "
+                    "an unknown model with s2.1-pro instead of refusing, so the voice about to be "
+                    "used is not the one asked for; note Fish may also have added it after this "
+                    "document. Check " + base_ + "/openapi.json");
+            }
+        }
+        else
+        {
+            Log("VRMPet: tts model '" + ttsModel_ + "' from " + modelSource_
+                + " - the list of models could not be read from " + base_ + "/openapi.json ("
+                + modelListError_ + "), so the name is sent unchecked");
+        }
 
         // Strip a trailing slash so every path join is one shape.
         while (!base_.empty() && base_.back() == '/')
             base_.pop_back();
 
-        Log("VRMPet: env " + (envPath_.empty() ? std::string("(none found)")
-                                                : envPath_ + "  keys: " + env.Keys()));
+        Log(std::string("VRMPet: fish key ") + (key_.empty() ? "MISSING" : "present")
+            + ", agent '" + (agentName_.empty() ? std::string("(unset)") : agentName_)
+            + "', from " + (config.Path().empty() ? std::string("(no config.txt)") : config.Path()));
 
         if (key_.empty())
         {
@@ -464,7 +576,10 @@ namespace vrmpet
             body["reference_id"] = agent_.voiceId;
 
         std::vector<HttpHeader> headers = Auth(key_);
-        headers.push_back({ L"model", Widen(ttsModel_) });
+        // No header at all when no model is configured, so "let Fish pick" is
+        // literally the same request the API documents for that case.
+        if (!ttsModel_.empty())
+            headers.push_back({ L"model", Widen(ttsModel_) });
 
         HttpResponse response;
         HttpRequest("POST", base_ + "/v1/tts", headers, body.dump(), response);

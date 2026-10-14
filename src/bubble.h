@@ -71,10 +71,44 @@ namespace vrmpet
         bool Render();                            // redraws only when dirty
         bool SaveBitmap(const std::string& path); // a real BMP, for eyeballing
 
-        static constexpr int kTurnsShown = 4;
-        static constexpr int kMaxSegments = 12;
+        // Everything about how the band looks, read from config.txt once in
+        // Create() (see config.h). The band's *size* is the caller's, because
+        // the window that holds it has to agree with the band; the style only
+        // decides what is drawn inside it.
+        struct Style
+        {
+            float padX          = 12.0f;
+            float padY          = 8.0f;
+            float radius        = 10.0f;
+            float gapBetween    = 8.0f;
+            float tailRoom      = 26.0f;
+            float tailRows      = 14.0f;
+            float tailBase      = 26.0f;
+            float fontSize      = 14.0f;
+            float statusFontSize = 11.0f;
+            float statusHeight  = 26.0f;
+            float lineHeight    = 19.0f;
+            int   turnsShown    = 4;
+            int   maxSegments   = 12;
+            int   historyLines  = 3;
+            std::wstring fontFamily = L"Segoe UI";
+            D2D1_COLOR_F agentColor  = {};
+            D2D1_COLOR_F userColor   = {};
+            D2D1_COLOR_F toolColor   = {};
+            D2D1_COLOR_F textColor   = {};
+            D2D1_COLOR_F borderColor = {};
+            D2D1_COLOR_F statusColor = {};
+            D2D1_COLOR_F meterTrack  = {};
+            D2D1_COLOR_F meterLive   = {};
+            D2D1_COLOR_F meterMuted  = {};
+        };
+
+        const Style& GetStyle() const { return style_; }
 
     private:
+        void LoadStyle();
+
+        Style style_;
         ID2D1Factory*          d2d_ = nullptr;
         IDWriteFactory*        dwrite_ = nullptr;
         ID2D1DCRenderTarget*   target_ = nullptr;

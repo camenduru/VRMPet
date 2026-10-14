@@ -49,13 +49,15 @@ add_subdirectory("${WICKED_ENGINE_DIR}" "${CMAKE_BINARY_DIR}/wickedengine")
 add_executable(VRMPet WIN32
     src/main.cpp
     # Voice and chat (option A: everything in C++, no WebRTC).
-    #   util    string/path/.env helpers and the one logger
+    #   config  every tuning constant and the credentials, from config.txt
+    #   util    string/path helpers and the one logger
     #   http    WinHTTP, because WickedEngine has no HTTP client
     #   voice   WASAPI capture, the WAV header, and the validator that keeps a
     #           network WAV away from wiAudio's unbounded chunk walker
     #   fish    /v1/asr, the agent's own LLM, /v1/tts
     #   bubble  the transcript band, Direct2D into the overlay's bitmap
     #   petcall the turn: mic -> text -> reply -> speech -> mouth
+    src/config.cpp
     src/util.cpp
     src/http.cpp
     src/voice.cpp

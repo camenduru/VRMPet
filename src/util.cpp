@@ -98,83 +98,36 @@ namespace vrmpet
     }
 
     // -----------------------------------------------------------------------
-    // .env
+    // key = value files
     // -----------------------------------------------------------------------
-    bool Env::Load(const std::vector<std::string>& dirs)
+    bool ParseKeyValues(const std::string& path,
+                        std::vector<std::pair<std::string, std::string>>& out)
     {
-        for (const std::string& dir : dirs)
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open())
+            return false;
+
+        std::string line;
+        while (std::getline(file, line))
         {
-            if (dir.empty())
+            line = Trim(line);
+            if (line.empty() || line[0] == '#')
                 continue;
-            const std::string candidate = JoinPath(dir, ".env");
-            std::ifstream file(candidate, std::ios::binary);
-            if (!file.is_open())
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos)
                 continue;
-
-            path_ = candidate;
-            items_.clear();
-
-            std::string line;
-            while (std::getline(file, line))
+            std::string key = Trim(line.substr(0, eq));
+            std::string value = Trim(line.substr(eq + 1));
+            if (value.size() >= 2 &&
+                ((value.front() == '"' && value.back() == '"') ||
+                 (value.front() == '\'' && value.back() == '\'')))
             {
-                line = Trim(line);
-                if (line.empty() || line[0] == '#')
-                    continue;
-                const size_t eq = line.find('=');
-                if (eq == std::string::npos)
-                    continue;
-                std::string key = Trim(line.substr(0, eq));
-                std::string value = Trim(line.substr(eq + 1));
-                if (value.size() >= 2 &&
-                    ((value.front() == '"' && value.back() == '"') ||
-                     (value.front() == '\'' && value.back() == '\'')))
-                {
-                    value = value.substr(1, value.size() - 2);
-                }
-                if (!key.empty())
-                    items_.emplace_back(key, value);
+                value = value.substr(1, value.size() - 2);
             }
-            return true;
+            if (!key.empty())
+                out.emplace_back(key, value);
         }
-        return false;
-    }
-
-    bool Env::Has(const std::string& key) const
-    {
-        for (const auto& item : items_)
-        {
-            if (item.first == key)
-                return true;
-        }
-        return false;
-    }
-
-    std::string Env::Get(const std::string& key, const std::string& fallback) const
-    {
-        for (const auto& item : items_)
-        {
-            if (item.first == key)
-                return item.second;
-        }
-        return fallback;
-    }
-
-    std::string Env::Keys() const
-    {
-        std::string out;
-        for (const auto& item : items_)
-        {
-            if (!out.empty())
-                out += ", ";
-            out += item.first;
-        }
-        return out;
-    }
-
-    Env& Environment()
-    {
-        static Env env;
-        return env;
+        return true;
     }
 
     // -----------------------------------------------------------------------

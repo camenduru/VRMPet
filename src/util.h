@@ -27,31 +27,11 @@ namespace vrmpet
     std::string Fmt(float v, int decimals = 4);
     std::string FmtMs(long long ms);
 
-    // -----------------------------------------------------------------------
-    // .env
-    //
-    // The key lives in the project's .env and nothing else reads it: it is
-    // never logged, never printed, and never sent anywhere except the host in
-    // FISH_API_BASE. Keys() returns the names alone, which is what the startup
-    // log reports - a key name that is missing is the whole diagnostic, and
-    // printing the value would put the credential in a file that gets pasted
-    // into bug reports.
-    // -----------------------------------------------------------------------
-    class Env
-    {
-    public:
-        // First directory that contains a .env wins.
-        bool Load(const std::vector<std::string>& dirs);
-        bool        Has(const std::string& key) const;
-        std::string Get(const std::string& key, const std::string& fallback = {}) const;
-        const std::string& Path() const { return path_; }
-        std::string Keys() const;   // "FISH_API_KEY, AGENT" - names only
-    private:
-        std::vector<std::pair<std::string, std::string>> items_;
-        std::string path_;
-    };
-
-    Env& Environment();
+    // Credentials and settings both come from config.txt, which is read by
+    // vrmpet::Settings() (see config.h). Nothing in this file knows about a key:
+    // the values are never logged, only the names of the keys that were set, so
+    // a diagnostic can report the shape of the problem without putting the
+    // credential into a file that gets pasted into bug reports.
 
     // -----------------------------------------------------------------------
     // Logging
@@ -63,6 +43,19 @@ namespace vrmpet
     // -----------------------------------------------------------------------
     void Log(const std::string& msg);
     void LogFlush();
+
+    // -----------------------------------------------------------------------
+    // key = value files
+    //
+    // One pair per line, blanks ignored, an optional pair of quotes around the
+    // value, and a line whose first non-space character is '#' is a comment.
+    // A '#' anywhere else is part of the value rather than the start of a
+    // comment: colours are written #RRGGBB, and a reader that cannot tell those
+    // two apart would quietly turn every colour into a truncation. A path that
+    // will not open is not an error, it is an empty list.
+    // -----------------------------------------------------------------------
+    bool ParseKeyValues(const std::string& path,
+                        std::vector<std::pair<std::string, std::string>>& out);
 
     double NowSeconds();
 }

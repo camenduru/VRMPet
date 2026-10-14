@@ -14,12 +14,19 @@
 //
 //  Uses only public WickedEngine API. Nothing in the engine is modified.
 //
-//  Capture mode - writes PNGs for analysis:
-//    VRMPet.exe [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa] [anim.vrma]
+//  No arguments is the pet: `VRMPet.exe` alone is overlay mode with the idle
+//  loop and the agent, which is what this program is for. Everything below is
+//  that same run with something changed.
 //
 //  Overlay mode - the avatar standing on the desktop, no window, no background:
-//    VRMPet.exe overlay [model.vrm] [azimuth-deg] [msaa] [seconds] [anim.vrma]
+//    VRMPet.exe [overlay] [model.vrm] [azimuth-deg] [msaa] [seconds] [anim.vrma]
 //      azimuth 180 faces the camera. seconds 0 = run until Ctrl+Shift+Q.
+//
+//  Capture mode - writes PNGs for analysis. It has to name itself, because the
+//  bare command line now belongs to the overlay:
+//    VRMPet.exe capture [out-dir] [model.vrm] [azimuth-deg] [focus-mesh] [isolate-mesh] [msaa] [anim.vrma]
+//  Any first argument that is not a mode word is still read as out-dir, so the
+//  old capture command lines keep working.
 //
 //  Both modes default to the assets/ copy of the avatar, so the tool runs with
 //  no arguments at all. Overlay mode also defaults to the assets/ idle loop,
@@ -39,10 +46,15 @@
 //    mic  -> POST /v1/asr   -> the agent's own LLM (no extra LLM)
 //         -> POST /v1/tts   -> wi::audio -> the mouth
 //
-//  Messages appear in a speech bubble composited into the same layered window,
-//  so there is no second window and no separate log. Ctrl+Shift+V pastes the
-//  clipboard as a chat message, Ctrl+Shift+H widens the transcript band,
-//  Ctrl+Shift+M mutes the microphone, Ctrl+Shift+Q still quits.
+//  Messages appear in a speech bubble above the avatar's head, composited into
+//  the same layered window, so there is no second window and no separate log.
+//  Ctrl+Shift+V pastes the clipboard as a chat message, Ctrl+Shift+H widens the
+//  transcript band, Ctrl+Shift+M mutes the microphone, Ctrl+Shift+Q still quits.
+//
+//  Everything tunable - the band's size and colours, the avatar's headroom, the
+//  mouth gain, the API key, the agent, the voice model and the greeting - lives
+//  in config.txt next to VRMPet.exe. See src/config.h; the file is written with
+//  every key and its comment on a run where none is found.
 //
 //  Each leg also has a command-line probe that runs before the engine starts, so
 //  a failure has one possible cause:
@@ -60,6 +72,7 @@
 #include <shellapi.h>
 
 #include "bubble.h"
+#include "config.h"
 #include "fish.h"
 #include "petcall.h"
 #include "util.h"
@@ -83,7 +96,35 @@ void ImportModel_GLTF(const std::string& fileName, wi::scene::Scene& scene);
 
 namespace
 {
-    constexpr int     kWindowSize     = 1024;
+    // -----------------------------------------------------------------------
+    // config.txt
+    //
+    // Beside VRMPet.exe first, then the working directory, then upwards - the
+    // same folder-first rule ResolveAssetPath() uses for the avatar, so the tool
+    // behaves the same from build/run, from the project root and from a shortcut
+    // with an unrelated working directory. The file is the interface: every
+    // number that used to be a constant here is read from it, and a key the file
+    // omits keeps the default in config.cpp.
+    // -----------------------------------------------------------------------
+    std::vector<std::string> ConfigSearchPath()
+    {
+        const std::string exeDir = vrmpet::ExeDirectory();
+        return {
+            exeDir,                              // build/run/config.txt
+            vrmpet::WorkingDirectory(),
+            vrmpet::JoinPath(exeDir, ".."),      // build/config.txt
+            vrmpet::JoinPath(exeDir, "../.."),   // <project>/config.txt
+        };
+    }
+
+    int   WindowSize()  { return vrmpet::Settings().Int("overlay.window_size"); }
+    int   CropPad()     { return vrmpet::Settings().Int("overlay.crop_pad"); }
+    int   CheckFrames() { return vrmpet::Settings().Int("overlay.check_frames"); }
+    int   SettleFrames(){ return vrmpet::Settings().Int("overlay.settle_frames"); }
+    int   BandGap()     { return vrmpet::Settings().Int("band.gap"); }
+    int   BandWidth()   { return vrmpet::Settings().Int("band.width"); }
+    int   BandHeight()  { return vrmpet::Settings().Int("band.height"); }
+
     constexpr int     kFrameFrames    = 8;   // frames to let scene bounds settle
     constexpr int     kSettleFrames   = 30;  // frames to render before capturing
     constexpr uint8_t kUserStencilRef = 0x01;
@@ -224,41 +265,48 @@ namespace
     // -----------------------------------------------------------------------
     bool g_overlayMode   = false;
     int  g_overlaySecs   = 0;   // 0 = run until Ctrl+Shift+Q
+    bool g_overlaySecsFromCli = false;
     int  g_overlayMargin = 0;   // gap between the character and the work-area edge
 
     // -----------------------------------------------------------------------
     // The bubble band, and why the canvas is bigger than the avatar
     //
     // The window's bottom-right corner is pinned to the work area and the canvas
-    // grows *left and up* to hold the band. The avatar therefore lands on exactly
-    // the pixel it used to: px + avatarX == wa.right - cropW - g_overlayMargin.
+    // grows *up* to hold the band. The avatar therefore lands on exactly the
+    // pixel it used to: px + avatarX == wa.right - cropW - g_overlayMargin.
     // The band is measured once, before the window exists, and never resized -
-    // the same rule kOverlayPad follows for the avatar itself.
+    // the same rule overlay.crop_pad follows for the avatar itself.
+    //
+    // The band and the avatar are both glued to the canvas's right edge, so the
+    // transcript hangs over the avatar's head. Left-aligning the band instead
+    // would park it in the empty desktop beside the character, which is where it
+    // was and where it looked wrong: the pet is in the corner of the screen, so
+    // "above the pet" and "the right edge of the screen" are the same place.
     // -----------------------------------------------------------------------
-    constexpr int kOverlayGap      = 24;    // between the band and the avatar
-    constexpr int kBubbleBandWidth = 420;
-    constexpr int kBubbleBandHeight = 214;  // 4 one-line bubbles + status + tail
+    // BandGap(), BandWidth() and BandHeight() above are the live values; these
+    // are only what the comments refer to.
 
     // Voice and chat. The transport is built by PetApp::StartVoice(), which is
     // the only place that knows a network exists.
     std::string g_askText;                  // "ask" mode: one scripted turn, then quit
+    bool        g_askMode = false;          // ...and only that one turn: no greeting
     std::string g_probeMode;                // agent | asr | tts | mic | bubble
     std::string g_probeArg;
     int         g_probeSeconds = 6;
     float       g_mouthGain = 1.0f;
+    bool        g_mouthGainFromCli = false;
     bool        g_micEnabled = true;
 
     // Frames to render before the first blit, so spring bones and temporal
     // effects have settled and the character is not captured mid-twitch.
-    constexpr int kOverlaySettleFrames = 30;
+
 
     // An idle loop sways the hips and swings the arms, so the tight alpha box
     // measured over the first few settled frames is not necessarily the box for
     // the whole loop. Pad it generously, and re-measure once a second so a
     // too-tight crop reports itself as a number in the log rather than as a
     // hand quietly losing its fingers at the window edge.
-    constexpr int kOverlayPad         = 40;
-    constexpr int kOverlayCheckFrames = 60;
+
 
     // Set by PetApp once the overlay window exists. The hotkeys are registered
     // on that window, so its window proc is where they arrive - and the proc is
@@ -559,7 +607,7 @@ namespace
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
             Bubble bubble;
-            if (!bubble.Create(kBubbleBandWidth, kBubbleBandHeight))
+            if (!bubble.Create(BandWidth(), BandHeight()))
             {
                 Log("VRMPet: probe bubble FAILED - the band was not created");
                 return 1;
@@ -765,6 +813,7 @@ public:
     bool overlayReady   = false;
     int  overlaySettle  = 0;
     bool overlayCreated = false;
+    bool greeted       = false;
     int  cropX = 0, cropY = 0, cropW = 0, cropH = 0;
     long long overlayFrames = 0;
     std::chrono::steady_clock::time_point overlayClock;
@@ -780,7 +829,7 @@ public:
     vrmpet::Speaker        speaker;
     vrmpet::CallController call;
     bool   voiceStarted = false;
-    int    bandW = 0, bandH = 0, avatarX = 0, avatarY = 0;
+    int    bandW = 0, bandH = 0, bandX = 0, avatarX = 0, avatarY = 0;
     bool   askSent = false;
     bool   bandNotYetComposited = true;
     double askStartAt = -1.0;
@@ -1062,16 +1111,13 @@ private:
     // -----------------------------------------------------------------------
     void StartVoice()
     {
-        const std::string exeDir = vrmpet::ExeDirectory();
-        const std::vector<std::string> envDirs = {
-            vrmpet::WorkingDirectory(),
-            exeDir,
-            vrmpet::JoinPath(exeDir, ".."),
-            vrmpet::JoinPath(exeDir, "../.."),
-            vrmpet::JoinPath(exeDir, "../../.."),
-        };
+        // config.txt is looked for beside the executable first, then in the
+        // working directory, then upwards - the same folder-first rule the
+        // assets use, so it works from build/run, from the project root and from
+        // a shortcut with any working directory at all.
+        const std::vector<std::string> configDirs = ConfigSearchPath();
 
-        call.Configure(envDirs);
+        call.Configure(configDirs);
 
         // The samples cross the thread boundary once per spoken sentence and are
         // owned by the main thread from that point on.
@@ -1127,7 +1173,15 @@ private:
         }
         case 3:
         {
-            const int next = bubble.HistoryLines() == 1 ? 3 : 1;
+            // One line and the configured default: the band clamps the default
+            // to what actually fits, so the pair is never the same number twice.
+            const int wide = bubble.GetStyle().historyLines;
+            if (wide <= 1)
+            {
+                Log("VRMPet: band.history_lines is 1 - nothing to toggle; raise it in config.txt");
+                break;
+            }
+            const int next = bubble.HistoryLines() == 1 ? wide : 1;
             bubble.SetHistoryLines(next);
             Log("VRMPet: transcript band -> " + std::to_string(next) + " lines");
             break;
@@ -1142,7 +1196,7 @@ private:
 
     void OnFrameComplete()
     {
-        if (!g_overlayMode || !overlayReady || overlaySettle < kOverlaySettleFrames)
+        if (!g_overlayMode || !overlayReady || overlaySettle < SettleFrames())
             return;
         CaptureAndBlit();
     }
@@ -1186,10 +1240,11 @@ private:
         if (!TightBox(rgba, w, h, x, y, bw, bh))
             return false;
 
-        const int left   = std::max(0, x - kOverlayPad);
-        const int top    = std::max(0, y - kOverlayPad);
-        const int right  = std::min(w, x + bw + kOverlayPad);
-        const int bottom = std::min(h, y + bh + kOverlayPad);
+        const int pad    = CropPad();
+        const int left   = std::max(0, x - pad);
+        const int top    = std::max(0, y - pad);
+        const int right  = std::min(w, x + bw + pad);
+        const int bottom = std::min(h, y + bh + pad);
 
         cropX = left;
         cropY = top;
@@ -1221,7 +1276,7 @@ private:
             {
                 snprintf(buf, sizeof(buf),
                     "VRMPet: WARNING - character leaves the crop box by %d px "
-                    "(box %dx%d at %d,%d, tight %dx%d at %d,%d) - raise kOverlayPad",
+                    "(box %dx%d at %d,%d, tight %dx%d at %d,%d) - raise overlay.crop_pad",
                     worst, cropW, cropH, cropX, cropY, bw, bh, x, y);
             }
             else
@@ -1263,12 +1318,16 @@ private:
 
             // The bubble band is reserved here, once, before the window exists:
             // the text grows inside it and the window never resizes.
-            bandW = kBubbleBandWidth;
-            bandH = kBubbleBandHeight;
-            const int canvasW = bandW + kOverlayGap + cropW;
-            const int canvasH = bandH + kOverlayGap + cropH;
-            avatarX = bandW + kOverlayGap;
-            avatarY = bandH + kOverlayGap;
+            bandW = BandWidth();
+            bandH = BandHeight();
+            // Both pinned to the right edge; the canvas is only as wide as the
+            // wider of the two, so the window no longer reserves a 420 px
+            // column that nothing is drawn in.
+            const int canvasW = (std::max)(bandW, cropW);
+            const int canvasH = bandH + BandGap() + cropH;
+            bandX   = canvasW - bandW;
+            avatarX = canvasW - cropW;
+            avatarY = bandH + BandGap();
 
             RECT wa = {};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
@@ -1300,16 +1359,30 @@ private:
                 + "  avatar " + std::to_string(cropW) + "x" + std::to_string(cropH)
                 + " at " + std::to_string(px + avatarX) + "," + std::to_string(py + avatarY)
                 + "  band " + std::to_string(bandW) + "x" + std::to_string(bandH)
+                + " at " + std::to_string(px + bandX) + "," + std::to_string(py)
                 + "  (work area " + std::to_string(wa.right - wa.left) + "x"
                 + std::to_string(wa.bottom - wa.top) + ", crop from "
                 + std::to_string(cropX) + "," + std::to_string(cropY) + ", "
-                + std::to_string(kOverlayPad) + " px pad for the animation)");
+                + std::to_string(CropPad()) + " px pad for the animation)");
             Log("VRMPet: avatar screen position is unchanged: "
                 + std::to_string(px + avatarX) + "," + std::to_string(py + avatarY));
             wi::backlog::Flush();
 
             overlayCreated = true;
             overlayClock = std::chrono::steady_clock::now();
+        }
+
+        // The pet says hello, once, as soon as it is actually standing there.
+        // Fired here rather than at startup for two reasons: the band exists by
+        // now, so the greeting lands in the bubble instead of being dropped, and
+        // the avatar is on screen, so the speech has something to come out of.
+        if (!greeted)
+        {
+            greeted = true;
+            if (g_askMode)
+                Log("VRMPet: not greeting - 'ask' mode runs exactly one scripted turn");
+            else
+                call.Greet();
         }
 
         // Render the band, and copy it into the canvas only when it changed. The
@@ -1323,7 +1396,7 @@ private:
                 const uint8_t* src = bubble.Row(row);
                 if (src == nullptr)
                     break;
-                memcpy(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4,
+                memcpy(g_overlay.bits + size_t(row) * size_t(g_overlay.w) * 4 + size_t(bandX) * 4,
                        src, size_t(bandW) * 4);
             }
         }
@@ -1333,7 +1406,7 @@ private:
 
         // The window is sized once and never resized, so re-measure occasionally
         // and complain if the animation has walked the character out of it.
-        if (++overlayCheck >= kOverlayCheckFrames)
+        if (++overlayCheck >= CheckFrames())
         {
             overlayCheck = 0;
             CheckCropBox(rgba.data(), w, h);
@@ -1809,8 +1882,8 @@ private:
 
         float w = cam.width;
         float h = cam.height;
-        if (!(w > 0.0f) || !std::isfinite(w)) w = float(kWindowSize);
-        if (!(h > 0.0f) || !std::isfinite(h)) h = float(kWindowSize);
+        if (!(w > 0.0f) || !std::isfinite(w)) w = float(WindowSize());
+        if (!(h > 0.0f) || !std::isfinite(h)) h = float(WindowSize());
 
         float fov = cam.fov;
         if (!(fov > 0.01f) || !(fov < XM_PI) || !std::isfinite(fov)) fov = XM_PI / 3.0f;
@@ -1982,10 +2055,27 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         {
             int base = 1;
             bool skipPositional = false;
+
+            // A bare `VRMPet.exe` is the pet, not the measuring instrument. The
+            // overlay is what this program is for, so it is the default: no
+            // arguments means the avatar goes on the desktop with the idle loop,
+            // the look-at solver, the agent behind Ctrl+Shift+V, no window of
+            // its own and nothing in the taskbar. Capture mode - the PNGs
+            // REPORT.md's measurements come from - still has its whole command
+            // line, but it now has to name itself, either with the `capture`
+            // keyword or by leading with an out-dir that is not a mode word.
+            if (argc <= 1)
+            {
+                g_overlayMode  = true;
+                g_animPath     = "assets/idle_loop.vrma";
+                g_lookAtCamera = true;
+                g_azimuthDeg   = 180.0f;
+                skipPositional = true;   // no arguments left to read
+            }
             // Overlay mode has its own argument layout, since it has no output
             // directory and no focus/isolate options.
             //   VRMPet.exe overlay [model.vrm] [azimuth] [msaa] [seconds] [anim.vrma]
-            if (argc > 1 && wcscmp(argv[1], L"overlay") == 0)
+            else if (wcscmp(argv[1], L"overlay") == 0)
             {
                 g_overlayMode = true;
                 base = 2;
@@ -2020,13 +2110,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                 g_lookAtCamera = true;
                 g_azimuthDeg   = 180.0f;
                 g_askText      = (argc > 2) ? Narrow(argv[2]) : "";
+                g_askMode      = true;
                 skipPositional = true;
             }
-            else if (argc > 1 && (wcscmp(argv[1], L"agent") == 0 ||
-                                  wcscmp(argv[1], L"tts")   == 0 ||
-                                  wcscmp(argv[1], L"asr")   == 0 ||
-                                  wcscmp(argv[1], L"bubble") == 0 ||
-                                  wcscmp(argv[1], L"mic")   == 0))
+            else if (wcscmp(argv[1], L"agent") == 0 ||
+                     wcscmp(argv[1], L"tts")   == 0 ||
+                     wcscmp(argv[1], L"asr")   == 0 ||
+                     wcscmp(argv[1], L"bubble") == 0 ||
+                     wcscmp(argv[1], L"mic")   == 0)
             {
                 g_probeMode = Narrow(argv[1]);
                 if (g_probeMode == "mic")
@@ -2035,29 +2126,39 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                     g_probeArg = Narrow(argv[2]);
                 skipPositional = true;
             }
+            else if (wcscmp(argv[1], L"capture") == 0)
+            {
+                // Spelling the mode out: the same layout as below, one argument
+                // to the right, so out-dir is argv[2].
+                base = 2;
+            }
 
             if (skipPositional)
             {
                 // This mode has its own layout and no positional arguments to read.
             }
-            else if (base == 2)
+            else if (g_overlayMode)
             {
                 if (argc > base + 0) g_modelPath   = Narrow(argv[base + 0]);
                 if (argc > base + 1) g_azimuthDeg  = float(_wtof(argv[base + 1]));
                 if (argc > base + 2) g_msaa        = _wtoi(argv[base + 2]);
-                if (argc > base + 3) g_overlaySecs = _wtoi(argv[base + 3]);
+                if (argc > base + 3)
+                {
+                    g_overlaySecs = _wtoi(argv[base + 3]);
+                    g_overlaySecsFromCli = true;
+                }
                 if (argc > base + 4) g_animPath    = Narrow(argv[base + 4]);
             }
             else
             {
-                //   VRMPet.exe <out-dir> [model.vrm] [azimuth] [focus] [isolate] [msaa] [anim.vrma]
-                if (argc > 1) g_outDir      = Narrow(argv[1]);
-                if (argc > 2) g_modelPath   = Narrow(argv[2]);
-                if (argc > 3) g_azimuthDeg  = float(_wtof(argv[3]));
-                if (argc > 4) g_focusMesh   = _wtoi(argv[4]);
-                if (argc > 5) g_isolateMesh = _wtoi(argv[5]);
-                if (argc > 6) g_msaa        = _wtoi(argv[6]);
-                if (argc > 7) g_animPath    = Narrow(argv[7]);
+                //   VRMPet.exe [capture] <out-dir> [model.vrm] [azimuth] [focus] [isolate] [msaa] [anim.vrma]
+                if (argc > base + 0) g_outDir      = Narrow(argv[base + 0]);
+                if (argc > base + 1) g_modelPath   = Narrow(argv[base + 1]);
+                if (argc > base + 2) g_azimuthDeg  = float(_wtof(argv[base + 2]));
+                if (argc > base + 3) g_focusMesh   = _wtoi(argv[base + 3]);
+                if (argc > base + 4) g_isolateMesh = _wtoi(argv[base + 4]);
+                if (argc > base + 5) g_msaa        = _wtoi(argv[base + 5]);
+                if (argc > base + 6) g_animPath    = Narrow(argv[base + 6]);
             }
 
             // Bare tokens anywhere on the command line, so they do not disturb the
@@ -2072,12 +2173,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
                 else if (_wcsicmp(argv[i], L"mute") == 0)
                     g_micEnabled = false;
                 else if (_wcsnicmp(argv[i], L"gain=", 5) == 0)
+                {
                     g_mouthGain = float(_wtof(argv[i] + 5));
+                    g_mouthGainFromCli = true;   // an explicit gain= beats config.txt
+                }
             }
 
             LocalFree(argv);
         }
     }
+
+    // config.txt is read before anything uses it: the probes below draw the band
+    // at the configured size, and the window is created at the configured size.
+    // Every value the command line did not set comes from the file from here on,
+    // and Settings().Load() is a no-op if something already loaded it.
+    vrmpet::Settings().Load(ConfigSearchPath());
+    if (!g_mouthGainFromCli)
+        g_mouthGain = vrmpet::Settings().Float("mouth.gain");
+    if (!g_overlaySecsFromCli)
+        g_overlaySecs = vrmpet::Settings().Int("overlay.seconds");
+    g_overlayMargin = vrmpet::Settings().Int("overlay.margin");
 
     // Every probe runs here: before a window, before WickedEngine, before any
     // shader is compiled. Nothing is presented and nothing is rendered, so the
@@ -2139,12 +2254,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         // textures, so the render is correct even though nothing is ever
         // presented to a visible window.
         hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet (engine, hidden)",
-            WS_POPUP, 0, 0, kWindowSize, kWindowSize,
+            WS_POPUP, 0, 0, WindowSize(), WindowSize(),
             nullptr, nullptr, hInstance, nullptr);
     }
     else
     {
-        RECT rc = { 0, 0, kWindowSize, kWindowSize };
+        RECT rc = { 0, 0, WindowSize(), WindowSize() };
         AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
         hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet - capture prototype",
             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

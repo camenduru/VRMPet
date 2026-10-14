@@ -106,6 +106,13 @@ namespace vrmpet
         bool Ready() const;
 
         void SendText(const std::string& text);       // clipboard or typed turn
+
+        // The first thing the pet does when it appears: one turn asking the
+        // agent to say hello. The prompt is an instruction to the agent, not
+        // something the user said, so it is kept out of the transcript - the
+        // band shows the greeting, not the request for it. Does nothing when
+        // there is no transport.
+        void Greet();
         void SetMicEnabled(bool enabled);
         bool MicEnabled() const;
         bool MicOpen() const;

@@ -1,4 +1,5 @@
 #include "bubble.h"
+#include "config.h"
 #include "util.h"
 
 #include <d2d1.h>
@@ -6,7 +7,9 @@
 #include <dwrite.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #pragma comment(lib, "d2d1.lib")
@@ -18,23 +21,51 @@ namespace vrmpet
 {
     namespace
     {
-        constexpr float kPadX = 12.0f;
-        constexpr float kPadY = 8.0f;
-        constexpr float kRadius = 10.0f;
-        constexpr float kGapBetween = 8.0f;
-        constexpr float kTailRoom = 26.0f;   // right margin the tail needs
-        constexpr float kFontSize = 14.0f;
-        constexpr float kSmallSize = 11.0f;
-        constexpr float kStatusHeight = 26.0f;   // status text + mic meter
-        constexpr float kLineHeight = 19.0f;     // one line of 14pt Segoe UI at 96 dpi
+        // #RRGGBB or #RRGGBBAA, which is how config.txt carries a colour. A
+        // value that is not one of those falls back to the built-in default and
+        // says so, rather than silently painting a bubble black.
+        D2D1_COLOR_F FromHex(const std::string& hex)
+        {
+            std::string s = hex;
+            if (!s.empty() && s[0] == '#')
+                s.erase(0, 1);
+            if (s.size() != 6 && s.size() != 8)
+                return ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+            for (char c : s)
+            {
+                if (!std::isxdigit((unsigned char)c))
+                    return ColorF(1.0f, 1.0f, 1.0f, 1.0f);
+            }
+            auto byte = [&](size_t index)
+            {
+                return float(std::strtol(s.substr(index, 2).c_str(), nullptr, 16)) / 255.0f;
+            };
+            return ColorF(byte(0), byte(1), byte(2), s.size() == 8 ? byte(3) : 1.0f);
+        }
 
-        ColorF FillFor(const std::string& role)
+        D2D1_COLOR_F FillFor(const Bubble::Style& style, const std::string& role)
         {
             if (role == "user")
-                return ColorF(1.0f, 0.95f, 0.83f, 0.94f);
+                return style.userColor;
             if (role == "tool")
-                return ColorF(0.88f, 0.88f, 0.92f, 0.90f);
-            return ColorF(0.99f, 0.99f, 1.0f, 0.95f);   // agent
+                return style.toolColor;
+            return style.agentColor;   // agent, and anything a future role adds
+        }
+
+        D2D1_COLOR_F ColorFromConfig(const std::string& key)
+        {
+            const std::string raw = Settings().Text(key);
+            const D2D1_COLOR_F value = FromHex(raw);
+            if (raw == Settings().Default(key))
+                return value;   // the built-in default, parsed once
+            if (value.r == 1.0f && value.g == 1.0f && value.b == 1.0f && value.a == 1.0f &&
+                raw != "#FFFFFFFF")
+            {
+                Log("VRMPet: config - " + key + " = '" + raw + "' is not #RRGGBB or #RRGGBBAA; using "
+                    + Settings().Default(key));
+                return FromHex(Settings().Default(key));
+            }
+            return value;
         }
 
         template <typename T>
@@ -65,12 +96,63 @@ namespace vrmpet
         Shutdown();
     }
 
+    // The band's style, from config.txt. Called before the bitmap exists so a
+    // metric that is nonsense in the file is reported once, at startup, next to
+    // the line that says which file was read.
+    void Bubble::LoadStyle()
+    {
+        const Config& config = Settings();
+
+        style_.padX            = config.Float("band.pad_x");
+        style_.padY            = config.Float("band.pad_y");
+        style_.radius          = config.Float("band.radius");
+        style_.gapBetween      = config.Float("band.line_gap");
+        style_.tailRoom        = config.Float("band.tail_room");
+        style_.tailRows        = config.Float("band.tail_rows");
+        style_.tailBase        = config.Float("band.tail_base");
+        style_.fontSize        = config.Float("band.font_size");
+        style_.statusFontSize  = config.Float("band.status_font_size");
+        style_.statusHeight    = config.Float("band.status_height");
+        style_.lineHeight      = config.Float("band.line_height");
+        style_.turnsShown      = (std::max)(1, config.Int("band.turns_shown"));
+        style_.maxSegments     = (std::max)(style_.turnsShown, config.Int("band.max_segments"));
+        style_.historyLines    = (std::min)(style_.turnsShown,
+                                            (std::max)(1, config.Int("band.history_lines")));
+        style_.fontFamily      = ToWide(config.Text("band.font_family"));
+        if (style_.fontFamily.empty())
+            style_.fontFamily = L"Segoe UI";
+
+        style_.agentColor  = ColorFromConfig("band.agent_color");
+        style_.userColor   = ColorFromConfig("band.user_color");
+        style_.toolColor   = ColorFromConfig("band.tool_color");
+        style_.textColor   = ColorFromConfig("band.text_color");
+        style_.borderColor = ColorFromConfig("band.border_color");
+        style_.statusColor = ColorFromConfig("band.status_color");
+        style_.meterTrack  = ColorFromConfig("band.mic_track_color");
+        style_.meterLive   = ColorFromConfig("band.mic_live_color");
+        style_.meterMuted  = ColorFromConfig("band.mic_muted_color");
+
+        // The height is the caller's, but the bubbles inside it are not: a file
+        // that asks for more lines than the band can hold would push the status
+        // line off the bottom.
+        const int capacity = int((float(height_) - style_.statusHeight) / (style_.lineHeight + style_.gapBetween));
+        if (capacity > 0 && style_.historyLines > capacity)
+        {
+            Log("VRMPet: config - band.history_lines " + std::to_string(style_.historyLines)
+                + " does not fit a " + std::to_string(height_) + " px band; using "
+                + std::to_string(capacity));
+            style_.historyLines = capacity;
+        }
+        historyLines_ = style_.historyLines;
+    }
+
     bool Bubble::Create(int width, int height)
     {
         Shutdown();
 
         width_ = width;
         height_ = height;
+        LoadStyle();
 
         // A DC to allocate against. The window is never shown and never used for
         // anything but this; CreateCompatibleDC against the screen is enough and
@@ -134,7 +216,7 @@ namespace vrmpet
 
         auto makeFormat = [&](float size, IDWriteTextFormat** out) -> bool
         {
-            HRESULT r = dwrite_->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            HRESULT r = dwrite_->CreateTextFormat(style_.fontFamily.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL,
                                                   DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                                                   size, L"", out);
             if (FAILED(r) || *out == nullptr)
@@ -143,7 +225,7 @@ namespace vrmpet
             return true;
         };
 
-        if (!makeFormat(kFontSize, &format_) || !makeFormat(kSmallSize, &formatSmall_))
+        if (!makeFormat(style_.fontSize, &format_) || !makeFormat(style_.statusFontSize, &formatSmall_))
         {
             Log("VRMPet: bubble - could not create the text formats");
             Shutdown();
@@ -195,8 +277,8 @@ namespace vrmpet
         turn.text = text;
         turn.final = final;
         turns_.insert(turns_.begin(), turn);      // newest on top
-        if (turns_.size() > kMaxSegments)
-            turns_.resize(kMaxSegments);
+        if (int(turns_.size()) > style_.maxSegments)
+            turns_.resize(size_t(style_.maxSegments));
         dirty_ = true;
     }
 
@@ -222,7 +304,7 @@ namespace vrmpet
 
     void Bubble::SetHistoryLines(int lines)
     {
-        const int clamped = std::clamp(lines, 1, kTurnsShown);
+        const int clamped = std::clamp(lines, 1, style_.turnsShown);
         if (clamped == historyLines_)
             return;
         historyLines_ = clamped;
@@ -265,11 +347,11 @@ namespace vrmpet
             return false;
         }
 
-        const float maxTextWidth = float(width_) - 2.0f * kPadX - kTailRoom;
+        const float maxTextWidth = float(width_) - 2.0f * style_.padX - style_.tailRoom;
         float y = 6.0f;
         const int visible = std::min<int>(historyLines_, int(turns_.size()));
         float lastBubbleLeft = 0.0f, lastBubbleBottom = 0.0f, lastBubbleRight = 0.0f;
-        D2D1_COLOR_F lastFill = ColorF(0.99f, 0.99f, 1.0f, 0.95f);
+        D2D1_COLOR_F lastFill = style_.agentColor;
 
         for (int i = 0; i < visible; ++i)
         {
@@ -286,24 +368,23 @@ namespace vrmpet
             DWRITE_TEXT_METRICS metrics = {};
             layout->GetMetrics(&metrics);
 
-            const float bubbleW = (std::min)(maxTextWidth, metrics.width) + 2.0f * kPadX;
-            const float bubbleH = metrics.height + 2.0f * kPadY;
-            const float left = float(width_) - kTailRoom - bubbleW;
+            const float bubbleW = (std::min)(maxTextWidth, metrics.width) + 2.0f * style_.padX;
+            const float bubbleH = metrics.height + 2.0f * style_.padY;
+            const float left = float(width_) - style_.tailRoom - bubbleW;
             const D2D1_RECT_F rect = RectF(left, y, left + bubbleW, y + bubbleH);
 
-            const D2D1_COLOR_F fill = FillFor(turn.role);
+            const D2D1_COLOR_F fill = FillFor(style_, turn.role);
             brush->SetColor(fill);
-            target_->FillRoundedRectangle(RoundedRect(rect, kRadius, kRadius), brush);
+            target_->FillRoundedRectangle(RoundedRect(rect, style_.radius, style_.radius), brush);
 
             // Straight alpha: D2D converts to the target's premultiplied alpha
             // itself. Multiplying by alpha here as well - which is what the
             // overlay's own BGRA write has to do - would darken every edge twice.
-            brush->SetColor(ColorF(0.20f, 0.22f, 0.28f, 0.55f));
-            target_->DrawRoundedRectangle(RoundedRect(rect, kRadius, kRadius), brush, 1.0f);
+            brush->SetColor(style_.borderColor);
+            target_->DrawRoundedRectangle(RoundedRect(rect, style_.radius, style_.radius), brush, 1.0f);
 
-            D2D1_COLOR_F textColor = ColorF(0.06f, 0.07f, 0.10f, 1.0f);
-            brush->SetColor(textColor);
-            target_->DrawTextLayout(Point2F(left + kPadX, y + kPadY), layout, brush);
+            brush->SetColor(style_.textColor);
+            target_->DrawTextLayout(Point2F(left + style_.padX, y + style_.padY), layout, brush);
 
             layout->Release();
 
@@ -311,7 +392,7 @@ namespace vrmpet
             lastBubbleRight = left + bubbleW;
             lastBubbleBottom = y + bubbleH;
             lastFill = fill;
-            y += bubbleH + kGapBetween;
+            y += bubbleH + style_.gapBetween;
         }
 
         // The tail, on the bottom-most bubble, pointing down-right at the head.
@@ -325,34 +406,34 @@ namespace vrmpet
         // reverse-engineering Direct2D's DC target, and it is exact.
         if (visible > 0)
         {
-            constexpr int   kTailRows = 14;
-            constexpr float kTailBase = 26.0f;
+            const int   tailRows = int(style_.tailRows);
+            const float tailBase = style_.tailBase;
             // Under the bottom-right of the last bubble, because that is the
             // direction the avatar's head is in.
             const float baseX = (std::max)(lastBubbleLeft + 30.0f, lastBubbleRight - 62.0f);
             const float baseY = lastBubbleBottom - 1.0f;
             brush->SetColor(lastFill);
-            for (int i = 0; i < kTailRows; ++i)
+            for (int i = 0; i < tailRows; ++i)
             {
-                const float t = float(i) / float(kTailRows);
+                const float t = float(i) / float(tailRows);
                 target_->FillRectangle(RectF(baseX + t * 8.0f, baseY + float(i),
-                                             baseX + t * 8.0f + kTailBase * (1.0f - t) + 4.0f,
+                                             baseX + t * 8.0f + tailBase * (1.0f - t) + 4.0f,
                                              baseY + float(i) + 1.0f), brush);
             }
         }
 
         // Status line and the mic meter, pinned to the bottom of the band.
         {
-            const float statusY = float(height_) - kStatusHeight;
+            const float statusY = float(height_) - style_.statusHeight;
             const std::wstring status = ToWide(status_);
             IDWriteTextLayout* layout = nullptr;
             if (!status.empty() &&
                 SUCCEEDED(dwrite_->CreateTextLayout(status.c_str(), UINT32(status.size()),
-                                                    formatSmall_, float(width_) - 2.0f * kPadX, 20.0f,
+                                                    formatSmall_, float(width_) - 2.0f * style_.padX, 20.0f,
                                                     &layout)) && layout != nullptr)
             {
-                brush->SetColor(ColorF(0.10f, 0.12f, 0.16f, 0.75f));
-                target_->DrawTextLayout(Point2F(kPadX, statusY), layout, brush);
+                brush->SetColor(style_.statusColor);
+                target_->DrawTextLayout(Point2F(style_.padX, statusY), layout, brush);
                 layout->Release();
             }
 
@@ -360,11 +441,10 @@ namespace vrmpet
             // me" is answerable without a second window or a log.
             const float meterY = float(height_) - 8.0f;
             const float meterW = 60.0f;
-            brush->SetColor(ColorF(0.30f, 0.32f, 0.38f, 0.35f));
-            target_->FillRectangle(RectF(kPadX, meterY, kPadX + meterW, meterY + 4.0f), brush);
-            brush->SetColor(micOpen_ ? ColorF(0.24f, 0.72f, 0.36f, 0.95f)
-                                    : ColorF(0.75f, 0.26f, 0.24f, 0.95f));
-            target_->FillRectangle(RectF(kPadX, meterY, kPadX + meterW * level_, meterY + 4.0f), brush);
+            brush->SetColor(style_.meterTrack);
+            target_->FillRectangle(RectF(style_.padX, meterY, style_.padX + meterW, meterY + 4.0f), brush);
+            brush->SetColor(micOpen_ ? style_.meterLive : style_.meterMuted);
+            target_->FillRectangle(RectF(style_.padX, meterY, style_.padX + meterW * level_, meterY + 4.0f), brush);
         }
 
         const HRESULT hr = target_->EndDraw();

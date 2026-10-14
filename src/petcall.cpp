@@ -1,4 +1,5 @@
 #include "petcall.h"
+#include "config.h"
 #include "voice.h"
 #include "util.h"
 
@@ -30,6 +31,31 @@ namespace vrmpet
         const float tau = (target > current) ? attack : release;
         const float k = 1.0f - std::exp(-std::max(0.0f, dt) / tau);
         return current + (target - current) * k;
+    }
+
+    namespace
+    {
+        // .env is read a line at a time, so a prompt that wants a line break has
+        // to ask for one. This is the whole escape vocabulary - three sequences,
+        // which is enough to lay a prompt out and small enough to hold in the
+        // head, and an unknown escape is left exactly as written.
+        std::string Unescape(const std::string& text)
+        {
+            std::string out;
+            out.reserve(text.size());
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                if (text[i] == '\\' && i + 1 < text.size())
+                {
+                    const char next = text[i + 1];
+                    if (next == 'n')  { out += '\n'; ++i; continue; }
+                    if (next == 't')  { out += '\t'; ++i; continue; }
+                    if (next == '\\') { out += '\\'; ++i; continue; }
+                }
+                out += text[i];
+            }
+            return out;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -479,12 +505,22 @@ namespace vrmpet
         std::atomic<bool> micEnabled{ true };
         std::atomic<uint32_t> nextSegment{ 1 };
 
+        // A turn waiting for the worker. `show` is false for a turn the user did
+        // not say - the startup greeting - so it reaches the agent as the user's
+        // message but never reaches the transcript.
+        struct QueuedTurn
+        {
+            std::string text;
+            bool        show = true;
+        };
+
         std::mutex mutex;
         std::deque<std::vector<int16_t>> utterances;
-        std::deque<std::string> typed;
+        std::deque<QueuedTurn> typed;
         std::vector<TurnMessage> history;
         std::vector<Event> pending;
 
+        std::string greetPrompt;   // .env GREET, empty when the pet stays quiet
         std::string mode = "idle";
         std::string error;
         double      errorAt = -1000.0;
@@ -525,10 +561,10 @@ namespace vrmpet
             Push(std::move(event));
         }
 
-        void HandleTurn(std::vector<int16_t> pcm, std::string text);
+        void HandleTurn(std::vector<int16_t> pcm, std::string text, bool show);
     };
 
-    void CallController::Impl::HandleTurn(std::vector<int16_t> pcm, std::string text)
+    void CallController::Impl::HandleTurn(std::vector<int16_t> pcm, std::string text, bool show)
     {
         const double turnStart = NowSeconds();
         long long asrMs = 0, agentMs = 0, ttsMs = 0;
@@ -580,8 +616,11 @@ namespace vrmpet
             return;
         }
 
-        const uint32_t userSegment = nextSegment.fetch_add(1);
+        // A hidden turn still becomes the user's message as far as the agent is
+        // concerned - that is what makes it answer - it just is not drawn.
+        if (show)
         {
+            const uint32_t userSegment = nextSegment.fetch_add(1);
             Event event;
             event.kind = EventKind::Transcript;
             event.segmentId = userSegment;
@@ -683,6 +722,17 @@ namespace vrmpet
             return;
         }
 
+        // What the pet says when it appears is the user's line to write, not
+        // this tool's: GREET in config.txt holds it. No GREET means it waits to
+        // be spoken to - a pet that talks first is a preference, and one that
+        // recites a prompt nobody chose would be worse than silence.
+        self.greetPrompt = Unescape(Trim(Settings().Text("GREET")));
+        if (self.greetPrompt.empty())
+            Log("VRMPet: no GREET in config.txt - the pet waits to be spoken to");
+        else
+            Log("VRMPet: startup greeting from config.txt GREET ("
+                + std::to_string(self.greetPrompt.size()) + " chars)");
+
         // The mouth's tuning is per-model: a quiet voice needs more gain than a
         // loud one. 1.0 is the studio's default and the design document's
         // starting point.
@@ -751,13 +801,15 @@ namespace vrmpet
         {
             std::vector<int16_t> pcm;
             std::string text;
+            bool show = true;
             bool have = false;
 
             {
                 std::scoped_lock lock(self.mutex);
                 if (!self.typed.empty())
                 {
-                    text = std::move(self.typed.front());
+                    text = std::move(self.typed.front().text);
+                    show = self.typed.front().show;
                     self.typed.pop_front();
                     have = true;
                 }
@@ -781,7 +833,7 @@ namespace vrmpet
                 continue;
             }
 
-            self.HandleTurn(std::move(pcm), std::move(text));
+            self.HandleTurn(std::move(pcm), std::move(text), show);
         }
     }
 
@@ -793,9 +845,36 @@ namespace vrmpet
         Impl& self = *impl_;
         {
             std::scoped_lock lock(self.mutex);
-            self.typed.push_back(trimmed);
+            self.typed.push_back({ trimmed, true });
         }
         Log("VRMPet: queued a typed turn (" + std::to_string(trimmed.size()) + " chars)");
+    }
+
+    void CallController::Greet()
+    {
+        Impl& self = *impl_;
+        if (!self.fishReady)
+        {
+            Log("VRMPet: no greeting - there is no transport to greet with");
+            return;
+        }
+
+        if (self.greetPrompt.empty())
+        {
+            Log("VRMPet: no greeting - GREET is not set in config.txt");
+            return;
+        }
+
+        // Sent as the user speaking, because that is the only role the agent
+        // harness gives us: there is no system message to add and no way to ask
+        // the agent for an opening line directly. Whatever GREET holds goes over
+        // verbatim - the wording is the user's - and it is the reply, not this,
+        // that is spoken and drawn.
+        {
+            std::scoped_lock lock(self.mutex);
+            self.typed.push_back({ self.greetPrompt, false });
+        }
+        Log("VRMPet: greeting the user from config.txt GREET; only the reply reaches the transcript");
     }
 
     void CallController::SetMicEnabled(bool enabled)
