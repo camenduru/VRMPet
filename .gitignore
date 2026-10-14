@@ -152,3 +152,4 @@ docs/DESIGN-voice-and-chat.md
 Thumbs.db
 desktop.ini
 .DS_Store
+.env
