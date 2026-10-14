@@ -27,7 +27,7 @@ AGENT =
 MODEL = drama-3
 
 # what the pet says when it appears; empty means it waits to be spoken to. \n is a line break
-GREET = 
+GREET = [I have just started the app and your avatar is standing on my desktop in front of me. Greet me in character, in one short sentence.]
 
 # --- avatar ---
 # how big the pet is on screen: 1.0 as framed, 2.0 twice as tall. 0.25..4
