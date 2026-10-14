@@ -128,6 +128,19 @@ namespace
     int   BandWidth()   { return vrmpet::Settings().Int("band.width"); }
     int   BandHeight()  { return vrmpet::Settings().Int("band.height"); }
 
+    // avatar.zoom, clamped, in one place. RenderSize() grows the render buffer by
+    // it. FrameCamera deliberately does NOT move the camera by it: pulling the
+    // camera closer is a true zoom-in and crops the pet.
+    float Zoom() { return (std::max)(0.25f, (std::min)(4.0f, vrmpet::Settings().Float("avatar.zoom"))); }
+
+    // The engine's render target, in px. avatar.zoom multiplies it: the camera keeps
+    // framing the whole avatar (FrameCamera), so the same framing is rasterised at
+    // zoom times the pixels, and the crop box - measured in those pixels - comes out
+    // zoom times larger on screen. Growing the buffer is what makes the pet bigger
+    // without cropping it, which is exactly what a fixed overlay.window_size failed
+    // to do past about 1.2 (the "zoom 2 cuts the pet" bug).
+    int RenderSize() { return int(std::lround(double(WindowSize()) * double(Zoom()))); }
+
     constexpr int     kFrameFrames    = 8;   // frames to let scene bounds settle
     constexpr int     kSettleFrames   = 30;  // frames to render before capturing
     constexpr uint8_t kUserStencilRef = 0x01;
@@ -2092,8 +2105,8 @@ private:
 
         float w = cam.width;
         float h = cam.height;
-        if (!(w > 0.0f) || !std::isfinite(w)) w = float(WindowSize());
-        if (!(h > 0.0f) || !std::isfinite(h)) h = float(WindowSize());
+        if (!(w > 0.0f) || !std::isfinite(w)) w = float(RenderSize());
+        if (!(h > 0.0f) || !std::isfinite(h)) h = float(RenderSize());
 
         float fov = cam.fov;
         if (!(fov > 0.01f) || !(fov < XM_PI) || !std::isfinite(fov)) fov = XM_PI / 3.0f;
@@ -2151,20 +2164,22 @@ private:
 
         const float rad  = g_azimuthDeg * XM_PI / 180.0f;
 
-        // How big the pet is, in one number. The framing distance is the only
-        // thing that decides the avatar's on-screen size, so zooming is moving
-        // the camera rather than scaling pixels: the render stays sharp at the
-        // configured window_size, and the crop box, the window, the band above
-        // the head and the mouth's pixel columns all follow without being told.
-        // Clamped, because 8.0 would put the camera inside the character and
-        // leave the crop box nothing to measure.
-        const float zoom = (std::max)(0.25f, (std::min)(4.0f, Settings().Float("avatar.zoom")));
-        const float dist = ((radius / tanf(fov * 0.5f)) * 1.15f) / zoom;
-        if (std::fabs(zoom - 1.0f) > 0.001f)
+        // The framing distance is fixed by the character's own size, so the whole
+        // avatar is always inside the frustum with 1.15 of headroom. avatar.zoom
+        // does NOT move the camera: pulling it closer is a true zoom-in, and the
+        // head and feet leave the frame - which is the "zoom 2 cuts the pet"
+        // bug. Instead the zoom multiplies the render target (RenderSize()), so
+        // the same framing is rasterised at more pixels; the avatar is measured
+        // as a tight box in those pixels, so it simply comes out larger on screen
+        // with nothing cropped.
+        const float dist = (radius / tanf(fov * 0.5f)) * 1.15f;
+
+        if (std::fabs(Zoom() - 1.0f) > 0.001f)
         {
-            wi::backlog::post("VRMPet: avatar.zoom " + Fmt(zoom, 2) + " - framing distance "
-                              + Fmt(dist, 2) + " (was "
-                              + Fmt((radius / tanf(fov * 0.5f)) * 1.15f, 2) + ")");
+            wi::backlog::post("VRMPet: avatar.zoom " + Fmt(Zoom(), 2) + " - render target "
+                              + std::to_string(RenderSize()) + " px (base "
+                              + std::to_string(WindowSize()) + ", framing distance "
+                              + Fmt(dist, 2) + " unchanged)");
         }
 
         const XMFLOAT3 eye = XMFLOAT3(
@@ -2481,12 +2496,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
         // textures, so the render is correct even though nothing is ever
         // presented to a visible window.
         hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet (engine, hidden)",
-            WS_POPUP, 0, 0, WindowSize(), WindowSize(),
+            WS_POPUP, 0, 0, RenderSize(), RenderSize(),
             nullptr, nullptr, hInstance, nullptr);
     }
     else
     {
-        RECT rc = { 0, 0, WindowSize(), WindowSize() };
+        RECT rc = { 0, 0, RenderSize(), RenderSize() };
         AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
         hWnd = CreateWindowW(wcex.lpszClassName, L"VRMPet - capture prototype",
             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

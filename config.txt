@@ -37,7 +37,7 @@ avatar.zoom = 1.0
 # gap in px between the pet and the edge of the work area
 overlay.margin = 0
 
-# engine render target, px; the avatar is captured from this and cropped
+# engine render target, px before avatar.zoom scales it; the avatar is captured from this and cropped
 overlay.window_size = 1024
 
 # headroom in px around the avatar, so an idle sway is never clipped

@@ -42,7 +42,7 @@ namespace vrmpet
 
             // --- the pet on the desktop --------------------------------------
             { "overlay", "overlay.margin",        "0",    "gap in px between the pet and the edge of the work area" },
-            { "overlay", "overlay.window_size",   "1024", "engine render target, px; the avatar is captured from this and cropped" },
+            { "overlay", "overlay.window_size",   "1024", "engine render target, px before avatar.zoom scales it; the avatar is captured from this and cropped" },
             { "overlay", "overlay.crop_pad",      "40",   "headroom in px around the avatar, so an idle sway is never clipped" },
             { "overlay", "overlay.check_frames",  "60",   "frames between re-measurements of the crop box" },
             { "overlay", "overlay.settle_frames", "30",   "frames rendered before the first capture, so spring bones have settled" },
